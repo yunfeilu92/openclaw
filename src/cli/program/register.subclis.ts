@@ -239,6 +239,14 @@ const entries: SubCliEntry[] = [
       mod.registerCompletionCli(program);
     },
   },
+  {
+    name: "storage",
+    description: "Cloud storage management",
+    register: async (program) => {
+      const mod = await import("../storage-cli.js");
+      mod.registerStorageCommands(program);
+    },
+  },
 ];
 
 export function getSubCliEntries(): SubCliEntry[] {

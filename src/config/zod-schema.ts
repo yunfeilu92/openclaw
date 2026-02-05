@@ -11,6 +11,7 @@ import {
   SessionSchema,
   SessionSendPolicySchema,
 } from "./zod-schema.session.js";
+import { StorageConfigSchema } from "./zod-schema.storage.js";
 
 const BrowserSnapshotDefaultsSchema = z
   .object({
@@ -508,6 +509,7 @@ export const OpenClawSchema = z
       .strict()
       .optional(),
     memory: MemorySchema,
+    storage: StorageConfigSchema,
     skills: z
       .object({
         allowBundled: z.array(z.string()).optional(),
