@@ -94,6 +94,12 @@ export type CliBackendConfig = {
 };
 
 export type AgentDefaultsConfig = {
+  /**
+   * Runtime backend for agent execution.
+   * - "pi": Built-in Pi Agent runner (default)
+   * - "agentcore": AWS Bedrock AgentCore Runtime
+   */
+  runtime?: "pi" | "agentcore";
   /** Primary model and fallbacks (provider/model). */
   model?: AgentModelListConfig;
   /** Optional image-capable model and fallbacks (provider/model). */

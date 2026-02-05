@@ -6,6 +6,7 @@ import { enqueueCommandInLane } from "../../process/command-queue.js";
 import { resolveUserPath } from "../../utils.js";
 import { isMarkdownCapableMessageChannel } from "../../utils/message-channel.js";
 import { resolveOpenClawAgentDir } from "../agent-paths.js";
+import { runAgentCoreAgent, shouldUseAgentCore } from "../agentcore-provider.js";
 import {
   isProfileInCooldown,
   markAuthProfileFailure,
@@ -73,6 +74,12 @@ function scrubAnthropicRefusalMagic(prompt: string): string {
 export async function runEmbeddedPiAgent(
   params: RunEmbeddedPiAgentParams,
 ): Promise<EmbeddedPiRunResult> {
+  // AgentCore Runtime switch - use AWS Bedrock AgentCore if configured
+  if (shouldUseAgentCore(params.config)) {
+    log.info(`using AgentCore runtime for session=${params.sessionKey || params.sessionId}`);
+    return runAgentCoreAgent(params);
+  }
+
   const sessionLane = resolveSessionLane(params.sessionKey?.trim() || params.sessionId);
   const globalLane = resolveGlobalLane(params.lane);
   const enqueueGlobal =

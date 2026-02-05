@@ -15,6 +15,7 @@ import {
 
 export const AgentDefaultsSchema = z
   .object({
+    runtime: z.union([z.literal("pi"), z.literal("agentcore")]).optional(),
     model: z
       .object({
         primary: z.string().optional(),
