@@ -584,6 +584,76 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
   }
 
   /**
+   * Append a conversational message to enable Long-term Memory extraction.
+   *
+   * Uses AgentCore's conversational payload format which enables:
+   * - Semantic understanding of conversation flow
+   * - Automatic extraction of facts, summaries, and insights
+   * - Long-term Memory record generation
+   *
+   * Also stores the line in blob format for transcript recovery.
+   */
+  async appendConversational(
+    namespace: string,
+    key: string,
+    role: "user" | "assistant",
+    content: string,
+    metadata?: Record<string, string>,
+  ): Promise<void> {
+    const client = this.getClient();
+    const actorId = this.buildActorId(namespace);
+    const sessionId = this.buildTranscriptSessionId(key);
+
+    // Map role to AgentCore format (uppercase)
+    const agentCoreRole = role === "user" ? "USER" : "ASSISTANT";
+
+    // Build metadata with timestamp if not provided
+    const eventMetadata: Record<string, { value: string }> = {};
+    if (metadata) {
+      for (const [k, v] of Object.entries(metadata)) {
+        eventMetadata[k] = { value: v };
+      }
+    }
+    if (!eventMetadata.timestamp) {
+      eventMetadata.timestamp = { value: new Date().toISOString() };
+    }
+
+    // Build transcript entry for recovery (same format as append)
+    const transcriptEntry = {
+      type: "message",
+      id: `${role}-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      message: {
+        role,
+        content: [{ type: "text", text: content }],
+        timestamp: Date.now(),
+      },
+    };
+
+    const command = new CreateEventCommand({
+      memoryId: this.getMemoryId(),
+      actorId,
+      sessionId,
+      eventTimestamp: new Date(),
+      // Use both conversational (for Long-term Memory) and blob (for transcript recovery)
+      payload: [
+        {
+          conversational: {
+            role: agentCoreRole,
+            content: { text: content },
+          },
+        },
+        {
+          blob: { _type: "line", text: JSON.stringify(transcriptEntry) },
+        },
+      ],
+      metadata: Object.keys(eventMetadata).length > 0 ? eventMetadata : undefined,
+    });
+
+    await client.send(command);
+  }
+
+  /**
    * Read all lines from a transcript session.
    */
   async *readLines(namespace: string, key: string): AsyncIterable<string> {

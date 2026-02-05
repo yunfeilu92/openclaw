@@ -101,6 +101,26 @@ export interface IStorageBackend {
   append(namespace: string, key: string, line: string): Promise<void>;
 
   /**
+   * Append a conversational message to enable Long-term Memory extraction.
+   * Uses structured conversational format for better semantic understanding.
+   *
+   * This is optional - backends that don't support it should fall back to append().
+   *
+   * @param namespace - The storage namespace
+   * @param key - The session/conversation key
+   * @param role - The message role ("user" or "assistant")
+   * @param content - The message content
+   * @param metadata - Optional metadata (timestamp, etc.)
+   */
+  appendConversational?(
+    namespace: string,
+    key: string,
+    role: "user" | "assistant",
+    content: string,
+    metadata?: Record<string, string>,
+  ): Promise<void>;
+
+  /**
    * Read lines from a transcript-style log.
    * Returns an async iterable for memory-efficient streaming.
    */

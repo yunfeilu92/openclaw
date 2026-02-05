@@ -201,41 +201,63 @@ export async function runAgentCoreAgent(
         const backend = storageService.getBackend(StorageNamespaces.TRANSCRIPTS);
         const transcriptSessionId = rawSessionKey;
 
-        // Write user message
-        const userEntry = {
-          type: "message",
-          id: `user-${Date.now()}`,
-          timestamp: new Date().toISOString(),
-          message: {
-            role: "user",
-            content: [{ type: "text", text: params.prompt }],
-            timestamp: started,
-          },
-        };
-        await backend.append(
-          StorageNamespaces.TRANSCRIPTS,
-          transcriptSessionId,
-          JSON.stringify(userEntry),
-        );
+        // Use appendConversational if available (enables Long-term Memory extraction)
+        const supportsConversational = typeof backend.appendConversational === "function";
 
-        // Write assistant response
-        const assistantEntry = {
-          type: "message",
-          id: `assistant-${Date.now()}`,
-          timestamp: new Date().toISOString(),
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: responseText }],
-            timestamp: Date.now(),
-            stopReason: "stop",
-            usage: { input: 0, output: 0, totalTokens: 0 },
-          },
-        };
-        await backend.append(
-          StorageNamespaces.TRANSCRIPTS,
-          transcriptSessionId,
-          JSON.stringify(assistantEntry),
-        );
+        if (supportsConversational) {
+          // Write user message with conversational format for Long-term Memory
+          await backend.appendConversational!(
+            StorageNamespaces.TRANSCRIPTS,
+            transcriptSessionId,
+            "user",
+            params.prompt,
+            { source: "webchat" },
+          );
+
+          // Write assistant response with conversational format
+          await backend.appendConversational!(
+            StorageNamespaces.TRANSCRIPTS,
+            transcriptSessionId,
+            "assistant",
+            responseText,
+            { source: "agentcore" },
+          );
+        } else {
+          // Fallback to blob format for backends that don't support conversational
+          const userEntry = {
+            type: "message",
+            id: `user-${Date.now()}`,
+            timestamp: new Date().toISOString(),
+            message: {
+              role: "user",
+              content: [{ type: "text", text: params.prompt }],
+              timestamp: started,
+            },
+          };
+          await backend.append(
+            StorageNamespaces.TRANSCRIPTS,
+            transcriptSessionId,
+            JSON.stringify(userEntry),
+          );
+
+          const assistantEntry = {
+            type: "message",
+            id: `assistant-${Date.now()}`,
+            timestamp: new Date().toISOString(),
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: responseText }],
+              timestamp: Date.now(),
+              stopReason: "stop",
+              usage: { input: 0, output: 0, totalTokens: 0 },
+            },
+          };
+          await backend.append(
+            StorageNamespaces.TRANSCRIPTS,
+            transcriptSessionId,
+            JSON.stringify(assistantEntry),
+          );
+        }
         log.info(`agentcore transcript written to storage: session=${transcriptSessionId}`);
 
         // Update session entry with AgentCore URI so chat.history can read from it
