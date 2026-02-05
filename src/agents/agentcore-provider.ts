@@ -39,13 +39,15 @@ function getClient(): BedrockAgentCoreClient {
 
 /**
  * Ensure session key meets AgentCore's minimum length requirement.
+ * Uses deterministic padding so the same input always produces the same output.
  */
 function ensureSessionKeyLength(sessionKey: string): string {
   if (sessionKey.length >= MIN_SESSION_KEY_LENGTH) {
     return sessionKey;
   }
-  // Pad with timestamp and random suffix
-  const padding = `-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  // Pad with deterministic suffix (repeating the key hash)
+  const needed = MIN_SESSION_KEY_LENGTH - sessionKey.length;
+  const padding = "-openclaw-agentcore-session-pad".slice(0, needed);
   return sessionKey + padding;
 }
 
