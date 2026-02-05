@@ -51,6 +51,12 @@ export {
   type SecretsManagerBackendConfig,
 } from "./backends/secrets-manager-backend.js";
 
+export {
+  DynamoDBBackend,
+  createDynamoDBBackend,
+  type DynamoDBBackendConfig,
+} from "./backends/dynamodb-backend.js";
+
 // Services
 export {
   StorageService,

@@ -48,15 +48,30 @@ export type SecretsManagerConfig = {
 };
 
 /**
+ * AWS DynamoDB configuration for session index storage.
+ */
+export type DynamoDBStorageConfig = {
+  /** DynamoDB table name */
+  tableName: string;
+  /** AWS region (defaults to AWS_REGION env var) */
+  region?: string;
+  /** TTL in seconds for session data (0 = no TTL, default: 30 days) */
+  ttlSeconds?: number;
+  /** GSI name for namespace queries (default: NamespaceIndex) */
+  namespaceIndexName?: string;
+};
+
+/**
  * Storage backend configuration.
  */
 export type StorageConfig = {
   /**
    * Primary storage backend type.
    * - "file": Local filesystem (default, backward compatible)
-   * - "agentcore": AWS Bedrock AgentCore Memory
+   * - "agentcore": AWS Bedrock AgentCore Memory (for transcripts)
+   * - "hybrid": Use DynamoDB for sessions + AgentCore for transcripts
    */
-  type?: "file" | "agentcore";
+  type?: "file" | "agentcore" | "hybrid";
 
   /**
    * Per-namespace data classification overrides.
@@ -65,9 +80,14 @@ export type StorageConfig = {
   dataClassification?: DataClassificationConfig;
 
   /**
-   * AgentCore Memory configuration (required when type is "agentcore").
+   * AgentCore Memory configuration (for transcripts storage).
    */
   agentcore?: AgentCoreStorageConfig;
+
+  /**
+   * DynamoDB configuration (for session index storage in hybrid mode).
+   */
+  dynamodb?: DynamoDBStorageConfig;
 
   /**
    * AWS Secrets Manager configuration (optional, for cloud auth storage).

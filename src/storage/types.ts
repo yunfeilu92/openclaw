@@ -11,7 +11,7 @@
 /**
  * Supported storage backend types.
  */
-export type StorageBackendType = "file" | "agentcore" | "secrets-manager";
+export type StorageBackendType = "file" | "agentcore" | "dynamodb" | "secrets-manager";
 
 /**
  * Health check result for storage backends.

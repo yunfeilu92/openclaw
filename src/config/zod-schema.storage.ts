@@ -43,13 +43,27 @@ export const SecretsManagerConfigSchema = z
   .optional();
 
 /**
+ * Zod schema for DynamoDB configuration.
+ */
+export const DynamoDBStorageConfigSchema = z
+  .object({
+    tableName: z.string().min(1),
+    region: z.string().optional(),
+    ttlSeconds: z.number().int().min(0).optional(),
+    namespaceIndexName: z.string().optional(),
+  })
+  .strict()
+  .optional();
+
+/**
  * Zod schema for storage configuration.
  */
 export const StorageConfigSchema = z
   .object({
-    type: z.union([z.literal("file"), z.literal("agentcore")]).optional(),
+    type: z.union([z.literal("file"), z.literal("agentcore"), z.literal("hybrid")]).optional(),
     dataClassification: DataClassificationConfigSchema,
     agentcore: AgentCoreStorageConfigSchema,
+    dynamodb: DynamoDBStorageConfigSchema,
     secretsManager: SecretsManagerConfigSchema,
     cacheEnabled: z.boolean().optional(),
     cacheTtlMs: z.number().int().positive().optional(),

@@ -2,16 +2,20 @@
  * Unified Storage Service
  *
  * Provides a high-level interface for storage operations that abstracts
- * the underlying backend (file, AgentCore Memory, Secrets Manager).
+ * the underlying backend (file, AgentCore Memory, DynamoDB, Secrets Manager).
  *
  * Features:
  * - Automatic backend selection based on configuration
  * - Hybrid storage: different backends for different data types
  * - Backward compatible: defaults to file storage
+ *
+ * Hybrid Architecture:
+ * - Sessions: DynamoDB (supports true deletion, TTL)
+ * - Transcripts: AgentCore Memory (append-only, semantic search)
+ * - Auth: Secrets Manager or File (secure credential storage)
+ * - Config: File (local configuration)
  */
 
-import os from "node:os";
-import path from "node:path";
 import type { StorageConfig } from "../config/types.storage.js";
 import type {
   IStorageBackend,
@@ -22,6 +26,7 @@ import type {
 } from "./types.js";
 import { resolveStateDir } from "../config/paths.js";
 import { AgentCoreMemoryBackend } from "./backends/agentcore-memory-backend.js";
+import { DynamoDBBackend } from "./backends/dynamodb-backend.js";
 import { FileBackend } from "./backends/file-backend.js";
 import { SecretsManagerBackend } from "./backends/secrets-manager-backend.js";
 import { StorageNamespaces } from "./types.js";
@@ -54,7 +59,7 @@ function resolveClassification(
   }
 
   // Defaults based on storage type
-  if (config.type === "agentcore") {
+  if (config.type === "agentcore" || config.type === "hybrid") {
     switch (namespace) {
       case StorageNamespaces.SESSIONS:
       case StorageNamespaces.TRANSCRIPTS:
@@ -77,6 +82,7 @@ export class StorageService implements IStorageService {
 
   private fileBackend: FileBackend | null = null;
   private agentcoreBackend: AgentCoreMemoryBackend | null = null;
+  private dynamodbBackend: DynamoDBBackend | null = null;
   private secretsManagerBackend: SecretsManagerBackend | null = null;
 
   private initialized = false;
@@ -88,6 +94,19 @@ export class StorageService implements IStorageService {
 
   /**
    * Get the backend for a specific namespace based on configuration.
+   *
+   * Routing logic:
+   * - hybrid mode:
+   *   - sessions -> DynamoDB (supports true deletion)
+   *   - transcripts -> AgentCore Memory (append-only, semantic search)
+   *   - auth -> Secrets Manager (if configured) or File
+   *   - config -> File
+   * - agentcore mode:
+   *   - sessions, transcripts -> AgentCore Memory
+   *   - auth -> Secrets Manager (if configured) or File
+   *   - config -> File
+   * - file mode:
+   *   - all -> File
    */
   getBackend(namespace: StorageNamespace): IStorageBackend {
     if (!this.initialized) {
@@ -101,10 +120,32 @@ export class StorageService implements IStorageService {
       return this.getSecretsManagerBackend();
     }
 
-    if (classification === "cloud" && this.config.type === "agentcore") {
+    // Hybrid mode routing
+    if (this.config.type === "hybrid" && classification === "cloud") {
+      if (namespace === StorageNamespaces.SESSIONS) {
+        // Sessions go to DynamoDB for true deletion support
+        if (this.config.dynamodb?.tableName) {
+          return this.getDynamoDBBackend();
+        }
+        // Fall back to AgentCore if DynamoDB not configured
+        if (this.config.agentcore?.memoryArn) {
+          return this.getAgentCoreBackend();
+        }
+      }
+      if (namespace === StorageNamespaces.TRANSCRIPTS) {
+        // Transcripts go to AgentCore Memory for append-only storage
+        if (this.config.agentcore?.memoryArn) {
+          return this.getAgentCoreBackend();
+        }
+      }
+    }
+
+    // AgentCore mode routing
+    if (this.config.type === "agentcore" && classification === "cloud") {
       return this.getAgentCoreBackend();
     }
 
+    // Default to file backend
     return this.getFileBackend();
   }
 
@@ -138,6 +179,26 @@ export class StorageService implements IStorageService {
     return this.agentcoreBackend;
   }
 
+  private getDynamoDBBackend(): DynamoDBBackend {
+    if (!this.dynamodbBackend) {
+      if (!this.config.dynamodb?.tableName) {
+        throw new Error(
+          "DynamoDB storage configured but tableName not provided. " +
+            "Set storage.dynamodb.tableName in your configuration.",
+        );
+      }
+      this.dynamodbBackend = new DynamoDBBackend({
+        tableName: this.config.dynamodb.tableName,
+        region: this.config.dynamodb.region,
+        ttlSeconds: this.config.dynamodb.ttlSeconds,
+        namespaceIndexName: this.config.dynamodb.namespaceIndexName,
+        cacheEnabled: this.config.cacheEnabled ?? true,
+        cacheTtlMs: this.config.cacheTtlMs,
+      });
+    }
+    return this.dynamodbBackend;
+  }
+
   private getSecretsManagerBackend(): SecretsManagerBackend {
     if (!this.secretsManagerBackend) {
       if (!this.config.secretsManager?.secretArn) {
@@ -167,13 +228,27 @@ export class StorageService implements IStorageService {
     await this.getFileBackend().initialize();
 
     // Initialize cloud backends if configured
-    if (this.config.type === "agentcore" && this.config.agentcore?.memoryArn) {
+    const isCloudMode = this.config.type === "agentcore" || this.config.type === "hybrid";
+
+    if (isCloudMode && this.config.agentcore?.memoryArn) {
       try {
         await this.getAgentCoreBackend().initialize();
       } catch (err) {
         // Log warning but don't fail - we can fall back to file backend
         console.warn(
           `AgentCore Memory initialization failed, falling back to file storage: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+
+    if (this.config.type === "hybrid" && this.config.dynamodb?.tableName) {
+      try {
+        await this.getDynamoDBBackend().initialize();
+      } catch (err) {
+        console.warn(
+          `DynamoDB initialization failed, falling back to file storage: ${
             err instanceof Error ? err.message : String(err)
           }`,
         );
@@ -207,6 +282,9 @@ export class StorageService implements IStorageService {
     if (this.agentcoreBackend) {
       closePromises.push(this.agentcoreBackend.close());
     }
+    if (this.dynamodbBackend) {
+      closePromises.push(this.dynamodbBackend.close());
+    }
     if (this.secretsManagerBackend) {
       closePromises.push(this.secretsManagerBackend.close());
     }
@@ -215,6 +293,7 @@ export class StorageService implements IStorageService {
 
     this.fileBackend = null;
     this.agentcoreBackend = null;
+    this.dynamodbBackend = null;
     this.secretsManagerBackend = null;
     this.initialized = false;
   }
@@ -262,7 +341,19 @@ export class StorageService implements IStorageService {
 
       if (namespace === StorageNamespaces.AUTH && this.config.secretsManager) {
         backendType = "secrets-manager";
-      } else if (classification === "cloud" && this.config.type === "agentcore") {
+      } else if (this.config.type === "hybrid" && classification === "cloud") {
+        // Hybrid mode backend selection
+        if (namespace === StorageNamespaces.SESSIONS && this.config.dynamodb?.tableName) {
+          backendType = "dynamodb";
+        } else if (
+          namespace === StorageNamespaces.TRANSCRIPTS &&
+          this.config.agentcore?.memoryArn
+        ) {
+          backendType = "agentcore";
+        } else if (this.config.agentcore?.memoryArn) {
+          backendType = "agentcore";
+        }
+      } else if (this.config.type === "agentcore" && classification === "cloud") {
         backendType = "agentcore";
       }
 

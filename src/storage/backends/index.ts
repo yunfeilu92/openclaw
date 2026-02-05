@@ -9,6 +9,11 @@ export {
   type AgentCoreMemoryBackendConfig,
 } from "./agentcore-memory-backend.js";
 export {
+  DynamoDBBackend,
+  createDynamoDBBackend,
+  type DynamoDBBackendConfig,
+} from "./dynamodb-backend.js";
+export {
   SecretsManagerBackend,
   createSecretsManagerBackend,
   type SecretsManagerBackendConfig,
