@@ -1,8 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { StorageConfig } from "../config/types.storage.js";
 import type { SessionPreviewItem } from "./session-utils.types.js";
 import { resolveSessionTranscriptPath } from "../config/sessions.js";
+import { isAgentCoreUri, readTranscriptMessagesFromUri } from "../storage/transcript-uri.js";
 import { stripEnvelope } from "./chat-sanitize.js";
 
 export function readSessionMessages(
@@ -33,6 +35,30 @@ export function readSessionMessages(
     }
   }
   return messages;
+}
+
+/**
+ * Read session messages asynchronously, supporting both local files and AgentCore URIs.
+ *
+ * @param sessionId - The session ID
+ * @param storePath - The store path
+ * @param sessionFile - Optional session file path or URI
+ * @param storageConfig - Optional storage configuration (required for AgentCore URIs)
+ * @returns Array of parsed message objects
+ */
+export async function readSessionMessagesAsync(
+  sessionId: string,
+  storePath: string | undefined,
+  sessionFile?: string,
+  storageConfig?: StorageConfig,
+): Promise<unknown[]> {
+  // If sessionFile is an AgentCore URI, use the async reader
+  if (sessionFile && isAgentCoreUri(sessionFile)) {
+    return readTranscriptMessagesFromUri(sessionFile, storageConfig);
+  }
+
+  // Otherwise, use synchronous file reading (existing behavior)
+  return readSessionMessages(sessionId, storePath, sessionFile);
 }
 
 export function resolveSessionTranscriptCandidates(

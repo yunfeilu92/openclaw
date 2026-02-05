@@ -15,6 +15,13 @@ import {
 } from "@aws-sdk/client-bedrock-agentcore";
 import type { RunEmbeddedPiAgentParams } from "./pi-embedded-runner/run/params.js";
 import type { EmbeddedPiRunResult } from "./pi-embedded-runner/types.js";
+import { resolveStorePath } from "../config/sessions/paths.js";
+import { updateSessionStore } from "../config/sessions/store.js";
+import { emitAgentEvent } from "../infra/agent-events.js";
+import { getStorageService } from "../storage/storage-service.js";
+import { buildAgentCoreTranscriptUri } from "../storage/transcript-uri.js";
+import { StorageNamespaces } from "../storage/types.js";
+import { resolveSessionAgentId } from "./agent-scope.js";
 import { log } from "./pi-embedded-runner/logger.js";
 
 // AgentCore configuration from environment
@@ -123,7 +130,21 @@ export async function runAgentCoreAgent(
     },
   };
 
-  log.info(`agentcore invoke start: session=${sessionKey} channel=${payload.context.channel}`);
+  log.info(
+    `agentcore invoke start: session=${sessionKey} channel=${payload.context.channel} runId=${params.runId || "none"}`,
+  );
+
+  // Emit lifecycle start event
+  if (params.runId) {
+    log.info(`agentcore emitting lifecycle start: runId=${params.runId}`);
+    emitAgentEvent({
+      runId: params.runId,
+      stream: "lifecycle",
+      data: { phase: "start", startedAt: started },
+    });
+  } else {
+    log.warn(`agentcore: no runId provided, events will not be emitted`);
+  }
 
   try {
     const command = new InvokeAgentRuntimeCommand({
@@ -170,6 +191,109 @@ export async function runAgentCoreAgent(
     const durationMs = Date.now() - started;
     log.info(`agentcore invoke complete: session=${sessionKey} duration=${durationMs}ms`);
 
+    // Write transcript to storage service if cloud storage is configured
+    const storageConfig = params.config?.storage;
+    const isCloudStorage = storageConfig?.type === "hybrid" || storageConfig?.type === "agentcore";
+    if (isCloudStorage && responseText) {
+      try {
+        const storageService = getStorageService(storageConfig);
+        await storageService.initialize();
+        const backend = storageService.getBackend(StorageNamespaces.TRANSCRIPTS);
+        const transcriptSessionId = rawSessionKey;
+
+        // Write user message
+        const userEntry = {
+          type: "message",
+          id: `user-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          message: {
+            role: "user",
+            content: [{ type: "text", text: params.prompt }],
+            timestamp: started,
+          },
+        };
+        await backend.append(
+          StorageNamespaces.TRANSCRIPTS,
+          transcriptSessionId,
+          JSON.stringify(userEntry),
+        );
+
+        // Write assistant response
+        const assistantEntry = {
+          type: "message",
+          id: `assistant-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: responseText }],
+            timestamp: Date.now(),
+            stopReason: "stop",
+            usage: { input: 0, output: 0, totalTokens: 0 },
+          },
+        };
+        await backend.append(
+          StorageNamespaces.TRANSCRIPTS,
+          transcriptSessionId,
+          JSON.stringify(assistantEntry),
+        );
+        log.info(`agentcore transcript written to storage: session=${transcriptSessionId}`);
+
+        // Update session entry with AgentCore URI so chat.history can read from it
+        const memoryArn = storageConfig?.agentcore?.memoryArn || process.env.AGENTCORE_MEMORY_ARN;
+        if (memoryArn && params.sessionKey) {
+          try {
+            const sessionFileUri = buildAgentCoreTranscriptUri(memoryArn, transcriptSessionId);
+            const agentId = resolveSessionAgentId({
+              sessionKey: params.sessionKey,
+              config: params.config,
+            });
+            const storePath = resolveStorePath(params.config?.session?.store, { agentId });
+            await updateSessionStore(storePath, (store) => {
+              const entry = store[params.sessionKey!];
+              if (entry) {
+                entry.sessionFile = sessionFileUri;
+                entry.updatedAt = Date.now();
+              }
+            });
+            log.info(
+              `agentcore session entry updated with URI: sessionKey=${params.sessionKey} sessionFile=${sessionFileUri}`,
+            );
+          } catch (updateErr) {
+            log.warn(
+              `agentcore session entry update failed: ${updateErr instanceof Error ? updateErr.message : String(updateErr)}`,
+            );
+          }
+        }
+      } catch (err) {
+        log.warn(
+          `agentcore transcript write failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    // Emit agent events so webchat/TUI clients receive the response
+    // (AgentCore doesn't emit streaming events like Pi, so we emit final events)
+    if (params.runId) {
+      // Emit assistant text
+      if (responseText) {
+        log.info(
+          `agentcore emitting assistant text: runId=${params.runId} textLen=${responseText.length}`,
+        );
+        emitAgentEvent({
+          runId: params.runId,
+          stream: "assistant",
+          data: { text: responseText },
+        });
+      }
+      // Emit lifecycle end
+      log.info(`agentcore emitting lifecycle end: runId=${params.runId}`);
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "lifecycle",
+        data: { phase: "end", startedAt: started, endedAt: Date.now() },
+      });
+    }
+
     // Call streaming callbacks if provided
     if (params.onPartialReply) {
       await params.onPartialReply({ text: responseText });
@@ -194,6 +318,15 @@ export async function runAgentCoreAgent(
     const errorMessage = error instanceof Error ? error.message : String(error);
 
     log.error(`agentcore invoke error: session=${sessionKey} error=${errorMessage}`);
+
+    // Emit lifecycle error event
+    if (params.runId) {
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "lifecycle",
+        data: { phase: "error", startedAt: started, endedAt: Date.now(), error: errorMessage },
+      });
+    }
 
     return {
       payloads: [

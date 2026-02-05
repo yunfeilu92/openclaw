@@ -35,6 +35,7 @@ import {
   capArrayByJsonBytes,
   loadSessionEntry,
   readSessionMessages,
+  readSessionMessagesAsync,
   resolveSessionModelRef,
 } from "../session-utils.js";
 import { formatForLog } from "../ws-log.js";
@@ -202,8 +203,26 @@ export const chatHandlers: GatewayRequestHandlers = {
     };
     const { cfg, storePath, entry } = loadSessionEntry(sessionKey);
     const sessionId = entry?.sessionId;
-    const rawMessages =
-      sessionId && storePath ? readSessionMessages(sessionId, storePath, entry?.sessionFile) : [];
+
+    // Read messages using async function that handles both local files and AgentCore URIs
+    let rawMessages: unknown[] = [];
+    const storageConfig = cfg.storage;
+
+    if (sessionId && storePath) {
+      try {
+        rawMessages = await readSessionMessagesAsync(
+          sessionId,
+          storePath,
+          entry?.sessionFile,
+          storageConfig,
+        );
+      } catch (err) {
+        // Fallback to synchronous local file reading
+        context.logGateway?.warn?.(`Async read failed, falling back to sync: ${err}`);
+        rawMessages = readSessionMessages(sessionId, storePath, entry?.sessionFile);
+      }
+    }
+
     const hardMax = 1000;
     const defaultLimit = 200;
     const requested = typeof limit === "number" ? limit : defaultLimit;

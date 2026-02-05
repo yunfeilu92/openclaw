@@ -64,3 +64,13 @@ export {
   resetStorageService,
   createStorageService,
 } from "./storage-service.js";
+
+// URI utilities
+export {
+  isAgentCoreUri,
+  parseTranscriptUri,
+  buildAgentCoreTranscriptUri,
+  readTranscriptMessagesFromUri,
+  shouldUseAgentCoreTranscripts,
+  type ParsedTranscriptUri,
+} from "./transcript-uri.js";

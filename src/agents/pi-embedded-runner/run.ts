@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import type { RunEmbeddedPiAgentParams } from "./run/params.js";
 import type { EmbeddedPiAgentMeta, EmbeddedPiRunResult } from "./types.js";
+import { registerAgentRunContext } from "../../infra/agent-events.js";
 import { enqueueCommandInLane } from "../../process/command-queue.js";
 import { resolveUserPath } from "../../utils.js";
 import { isMarkdownCapableMessageChannel } from "../../utils/message-channel.js";
@@ -76,7 +77,20 @@ export async function runEmbeddedPiAgent(
 ): Promise<EmbeddedPiRunResult> {
   // AgentCore Runtime switch - use AWS Bedrock AgentCore if configured
   if (shouldUseAgentCore(params.config)) {
-    log.info(`using AgentCore runtime for session=${params.sessionKey || params.sessionId}`);
+    log.info(
+      `using AgentCore runtime for session=${params.sessionKey || params.sessionId} runId=${params.runId || "none"}`,
+    );
+    // Register run context so agent events can be routed to the correct session
+    if (params.runId && params.sessionKey) {
+      log.info(`registering run context: runId=${params.runId} sessionKey=${params.sessionKey}`);
+      registerAgentRunContext(params.runId, {
+        sessionKey: params.sessionKey,
+      });
+    } else {
+      log.warn(
+        `missing runId or sessionKey: runId=${params.runId || "none"} sessionKey=${params.sessionKey || "none"}`,
+      );
+    }
     return runAgentCoreAgent(params);
   }
 
