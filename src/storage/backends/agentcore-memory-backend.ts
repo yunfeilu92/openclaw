@@ -48,6 +48,180 @@ const KV_SESSION_PREFIX = "kv-";
 const TRANSCRIPT_SESSION_PREFIX = "tr-";
 
 /**
+ * Convert a Python dict format string to JSON.
+ *
+ * AWS SDK may serialize DocumentType as Python dict format:
+ * - {key=value, nested={a=1, b=2}}
+ *
+ * This function converts it to valid JSON:
+ * - {"key": "value", "nested": {"a": "1", "b": "2"}}
+ *
+ * Known limitations:
+ * - String values containing '=' or ',' may not parse correctly
+ * - Nested structures with complex string values may fail
+ */
+function pythonDictToJson(str: string): string | null {
+  // First check if it's already valid JSON
+  try {
+    JSON.parse(str);
+    return str;
+  } catch {
+    // Not JSON, try to convert from Python dict
+  }
+
+  // Simple heuristic: if it doesn't look like Python dict, return null
+  if (!str.startsWith("{") || !str.endsWith("}")) {
+    return null;
+  }
+
+  // State machine to convert Python dict to JSON
+  let result = "";
+  let i = 0;
+  let depth = 0;
+  let inKey = false;
+  let keyStart = -1;
+
+  while (i < str.length) {
+    const ch = str[i];
+
+    if (ch === "{") {
+      result += "{";
+      depth++;
+      inKey = true;
+      keyStart = i + 1;
+      i++;
+    } else if (ch === "}") {
+      depth--;
+      result += "}";
+      inKey = false;
+      i++;
+    } else if (ch === "[") {
+      result += "[";
+      depth++;
+      i++;
+    } else if (ch === "]") {
+      depth--;
+      result += "]";
+      i++;
+    } else if (ch === "=" && inKey) {
+      // End of key, extract and quote it
+      const key = str.slice(keyStart, i).trim();
+      // Replace the unquoted key we might have added with quoted version
+      const lastBraceOrComma = Math.max(result.lastIndexOf("{"), result.lastIndexOf(","));
+      result = result.slice(0, lastBraceOrComma + 1);
+      result += `"${key}":`;
+      inKey = false;
+
+      // Now read the value
+      i++; // skip '='
+      // Skip whitespace
+      while (i < str.length && str[i] === " ") i++;
+
+      // Determine value type
+      if (str[i] === "{" || str[i] === "[") {
+        // Nested structure - will be handled by the main loop
+        continue;
+      }
+
+      // Find end of value (next ',' or '}' or ']' at current depth)
+      const valueStart = i;
+      let valueDepth = 0;
+      while (i < str.length) {
+        const vc = str[i];
+        if (vc === "{" || vc === "[") valueDepth++;
+        else if (vc === "}" || vc === "]") {
+          if (valueDepth === 0) break;
+          valueDepth--;
+        } else if (vc === "," && valueDepth === 0) {
+          break;
+        }
+        i++;
+      }
+      const value = str.slice(valueStart, i).trim();
+
+      // Quote the value if it's not a number, boolean, null, or already a structure
+      if (
+        value === "null" ||
+        value === "true" ||
+        value === "false" ||
+        /^-?\d+(\.\d+)?$/.test(value)
+      ) {
+        result += value;
+      } else {
+        // Escape quotes in value and wrap in quotes
+        result += `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+      }
+    } else if (ch === ",") {
+      result += ",";
+      inKey = true;
+      keyStart = i + 1;
+      i++;
+    } else if (inKey) {
+      // Part of key - skip, we'll extract it at '='
+      i++;
+    } else {
+      // Should not reach here normally
+      result += ch;
+      i++;
+    }
+  }
+
+  // Validate the result is valid JSON
+  try {
+    JSON.parse(result);
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extract the JSON content from AWS SDK's Python dict format response.
+ *
+ * AWS SDK may return blob as a Python dict format string like:
+ * - {_type=line, text={"type":"message",...}}  (new format with embedded JSON)
+ * - {_type=line, data={...}}  (old format with Python dict)
+ *
+ * This function extracts the embedded JSON from the text= field,
+ * or converts the old format Python dict to JSON.
+ */
+function extractJsonFromPythonDict(str: string): string | null {
+  // First try standard JSON parse
+  try {
+    JSON.parse(str);
+    return str; // Already valid JSON
+  } catch {
+    // Not valid JSON, continue
+  }
+
+  // Try to extract text= value which should be valid JSON (new format)
+  // Pattern: {_type=line, text={...JSON...}}
+  const textMatch = str.match(/\{_type=line,\s*text=(\{[\s\S]*\})\s*\}$/);
+  if (textMatch?.[1]) {
+    try {
+      JSON.parse(textMatch[1]);
+      return textMatch[1]; // Valid JSON extracted
+    } catch {
+      // Not valid JSON in text field
+    }
+  }
+
+  // Try to convert old format Python dict to JSON
+  // Pattern: {_type=line, data={...}}
+  const dataMatch = str.match(/\{_type=line,\s*data=(\{[\s\S]*\})\s*\}$/);
+  if (dataMatch?.[1]) {
+    const converted = pythonDictToJson(dataMatch[1]);
+    if (converted) {
+      // The converted object should have a 'message' field that we need
+      // Return the converted JSON directly
+      return converted;
+    }
+  }
+
+  return null;
+}
+
+/**
  * AWS Bedrock AgentCore Memory storage backend.
  */
 export class AgentCoreMemoryBackend implements IStorageBackend {
@@ -390,14 +564,9 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
     const actorId = this.buildActorId(namespace);
     const sessionId = this.buildTranscriptSessionId(key);
 
-    // Parse the line as JSON if possible, otherwise wrap as text
-    let blobData: DocumentType;
-    try {
-      const parsed = JSON.parse(line) as DocumentType;
-      blobData = { _type: "line", data: parsed };
-    } catch {
-      blobData = { _type: "line", text: line };
-    }
+    // Store the line as a text string to avoid AWS SDK DocumentType serialization issues
+    // AWS SDK may serialize nested objects as Python dict format instead of JSON
+    const blobData: DocumentType = { _type: "line", text: line };
 
     const command = new CreateEventCommand({
       memoryId: this.getMemoryId(),
@@ -443,23 +612,37 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
             continue;
           }
 
-          // blob is now a JSON document (DocumentType) with our wrapper format
+          // blob may be a string (from SDK) or a parsed object
+          if (typeof payload.blob === "string") {
+            // AWS SDK returns blob as Python dict format string
+            // Try to extract embedded JSON from text= field
+            const extracted = extractJsonFromPythonDict(payload.blob);
+            if (extracted) {
+              yield extracted;
+              continue;
+            }
+            // Could not extract, yield as-is (might be plain text or old format)
+            yield payload.blob;
+            continue;
+          }
+
+          // blob is already an object (parsed by SDK)
           const blob = payload.blob as Record<string, unknown>;
 
           // Convert blob back to JSON line
           let line: string;
           if (blob._type === "line") {
             if (blob.text !== undefined && typeof blob.text === "string") {
-              // Text wrapper format
+              // Text wrapper format (preferred)
               line = blob.text;
             } else if (blob.data !== undefined) {
-              // JSON data format
-              line = JSON.stringify(blob.data);
+              // JSON data format (legacy)
+              line = typeof blob.data === "string" ? blob.data : JSON.stringify(blob.data);
             } else {
               continue;
             }
           } else {
-            // Legacy or direct format - stringify entire blob
+            // Legacy or direct format
             line = JSON.stringify(blob);
           }
 

@@ -9,7 +9,7 @@
  */
 
 import type { StorageConfig } from "../config/types.storage.js";
-import { getStorageService } from "./storage-service.js";
+import { createStorageService } from "./storage-service.js";
 import { StorageNamespaces } from "./types.js";
 
 const AGENTCORE_SCHEME = "agentcore://";
@@ -106,7 +106,9 @@ export async function readTranscriptMessagesFromUri(
     return [];
   }
 
-  const storageService = getStorageService(storageConfig);
+  // Use createStorageService instead of getStorageService to ensure
+  // we use the correct config (singleton may have been created with different config)
+  const storageService = createStorageService(storageConfig);
   await storageService.initialize();
   const backend = storageService.getBackend(StorageNamespaces.TRANSCRIPTS);
   const messages: unknown[] = [];
