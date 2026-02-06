@@ -677,47 +677,52 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
         const events = response.events ?? [];
 
         for (const event of events as Event[]) {
-          const payload = event.payload?.[0];
-          if (!payload?.blob) {
-            continue;
-          }
-
-          // blob may be a string (from SDK) or a parsed object
-          if (typeof payload.blob === "string") {
-            // AWS SDK returns blob as Python dict format string
-            // Try to extract embedded JSON from text= field
-            const extracted = extractJsonFromPythonDict(payload.blob);
-            if (extracted) {
-              yield extracted;
+          // Iterate through ALL payload items (not just the first one)
+          // appendConversational creates events with multiple payloads:
+          // [conversational, blob] - we need to find the blob payload
+          const payloads = event.payload ?? [];
+          for (const payload of payloads) {
+            if (!payload?.blob) {
               continue;
             }
-            // Could not extract, yield as-is (might be plain text or old format)
-            yield payload.blob;
-            continue;
-          }
 
-          // blob is already an object (parsed by SDK)
-          const blob = payload.blob as Record<string, unknown>;
+            // blob may be a string (from SDK) or a parsed object
+            if (typeof payload.blob === "string") {
+              // AWS SDK returns blob as Python dict format string
+              // Try to extract embedded JSON from text= field
+              const extracted = extractJsonFromPythonDict(payload.blob);
+              if (extracted) {
+                yield extracted;
+                continue;
+              }
+              // Could not extract, yield as-is (might be plain text or old format)
+              yield payload.blob;
+              continue;
+            }
 
-          // Convert blob back to JSON line
-          let line: string;
-          if (blob._type === "line") {
-            if (blob.text !== undefined && typeof blob.text === "string") {
-              // Text wrapper format (preferred)
-              line = blob.text;
-            } else if (blob.data !== undefined) {
-              // JSON data format (legacy)
-              line = typeof blob.data === "string" ? blob.data : JSON.stringify(blob.data);
+            // blob is already an object (parsed by SDK)
+            const blob = payload.blob as Record<string, unknown>;
+
+            // Convert blob back to JSON line
+            let line: string;
+            if (blob._type === "line") {
+              if (blob.text !== undefined && typeof blob.text === "string") {
+                // Text wrapper format (preferred)
+                line = blob.text;
+              } else if (blob.data !== undefined) {
+                // JSON data format (legacy)
+                line = typeof blob.data === "string" ? blob.data : JSON.stringify(blob.data);
+              } else {
+                continue;
+              }
             } else {
-              continue;
+              // Legacy or direct format
+              line = JSON.stringify(blob);
             }
-          } else {
-            // Legacy or direct format
-            line = JSON.stringify(blob);
-          }
 
-          if (line.trim()) {
-            yield line.trim();
+            if (line.trim()) {
+              yield line.trim();
+            }
           }
         }
 
