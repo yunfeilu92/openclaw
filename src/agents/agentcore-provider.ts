@@ -191,112 +191,9 @@ export async function runAgentCoreAgent(
     const durationMs = Date.now() - started;
     log.info(`agentcore invoke complete: session=${sessionKey} duration=${durationMs}ms`);
 
-    // Write transcript to storage service if cloud storage is configured
-    const storageConfig = params.config?.storage;
-    const isCloudStorage = storageConfig?.type === "hybrid" || storageConfig?.type === "agentcore";
-    if (isCloudStorage && responseText) {
-      try {
-        const storageService = getStorageService(storageConfig);
-        await storageService.initialize();
-        const backend = storageService.getBackend(StorageNamespaces.TRANSCRIPTS);
-        const transcriptSessionId = rawSessionKey;
-
-        // Use appendConversational if available (enables Long-term Memory extraction)
-        const supportsConversational = typeof backend.appendConversational === "function";
-
-        if (supportsConversational) {
-          // Write user message with conversational format for Long-term Memory
-          await backend.appendConversational!(
-            StorageNamespaces.TRANSCRIPTS,
-            transcriptSessionId,
-            "user",
-            params.prompt,
-            { source: "webchat" },
-          );
-
-          // Write assistant response with conversational format
-          await backend.appendConversational!(
-            StorageNamespaces.TRANSCRIPTS,
-            transcriptSessionId,
-            "assistant",
-            responseText,
-            { source: "agentcore" },
-          );
-        } else {
-          // Fallback to blob format for backends that don't support conversational
-          const userEntry = {
-            type: "message",
-            id: `user-${Date.now()}`,
-            timestamp: new Date().toISOString(),
-            message: {
-              role: "user",
-              content: [{ type: "text", text: params.prompt }],
-              timestamp: started,
-            },
-          };
-          await backend.append(
-            StorageNamespaces.TRANSCRIPTS,
-            transcriptSessionId,
-            JSON.stringify(userEntry),
-          );
-
-          const assistantEntry = {
-            type: "message",
-            id: `assistant-${Date.now()}`,
-            timestamp: new Date().toISOString(),
-            message: {
-              role: "assistant",
-              content: [{ type: "text", text: responseText }],
-              timestamp: Date.now(),
-              stopReason: "stop",
-              usage: { input: 0, output: 0, totalTokens: 0 },
-            },
-          };
-          await backend.append(
-            StorageNamespaces.TRANSCRIPTS,
-            transcriptSessionId,
-            JSON.stringify(assistantEntry),
-          );
-        }
-        log.info(`agentcore transcript written to storage: session=${transcriptSessionId}`);
-
-        // Update session entry with AgentCore URI so chat.history can read from it
-        const memoryArn = storageConfig?.agentcore?.memoryArn || process.env.AGENTCORE_MEMORY_ARN;
-        if (memoryArn && params.sessionKey) {
-          try {
-            const sessionFileUri = buildAgentCoreTranscriptUri(memoryArn, transcriptSessionId);
-            const agentId = resolveSessionAgentId({
-              sessionKey: params.sessionKey,
-              config: params.config,
-            });
-            const storePath = resolveStorePath(params.config?.session?.store, { agentId });
-            await updateSessionStore(storePath, (store) => {
-              const entry = store[params.sessionKey!];
-              if (entry) {
-                entry.sessionFile = sessionFileUri;
-                entry.updatedAt = Date.now();
-              }
-            });
-            log.info(
-              `agentcore session entry updated with URI: sessionKey=${params.sessionKey} sessionFile=${sessionFileUri}`,
-            );
-          } catch (updateErr) {
-            log.warn(
-              `agentcore session entry update failed: ${updateErr instanceof Error ? updateErr.message : String(updateErr)}`,
-            );
-          }
-        }
-      } catch (err) {
-        log.warn(
-          `agentcore transcript write failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    }
-
-    // Emit agent events so webchat/TUI clients receive the response
-    // (AgentCore doesn't emit streaming events like Pi, so we emit final events)
+    // Emit agent events FIRST so webchat/TUI clients receive the response immediately.
+    // Storage writes happen in the background to avoid blocking the UI.
     if (params.runId) {
-      // Emit assistant text
       if (responseText) {
         log.info(
           `agentcore emitting assistant text: runId=${params.runId} textLen=${responseText.length}`,
@@ -307,13 +204,19 @@ export async function runAgentCoreAgent(
           data: { text: responseText },
         });
       }
-      // Emit lifecycle end
       log.info(`agentcore emitting lifecycle end: runId=${params.runId}`);
       emitAgentEvent({
         runId: params.runId,
         stream: "lifecycle",
         data: { phase: "end", startedAt: started, endedAt: Date.now() },
       });
+    }
+
+    // Write transcript to storage in the background (fire-and-forget)
+    const storageConfig = params.config?.storage;
+    const isCloudStorage = storageConfig?.type === "hybrid" || storageConfig?.type === "agentcore";
+    if (isCloudStorage && responseText) {
+      void writeTranscriptToStorage(params, storageConfig, rawSessionKey, responseText, started);
     }
 
     // Call streaming callbacks if provided
@@ -370,6 +273,109 @@ export async function runAgentCoreAgent(
         },
       },
     };
+  }
+}
+
+/**
+ * Persist user + assistant messages to cloud storage (background, best-effort).
+ */
+async function writeTranscriptToStorage(
+  params: RunEmbeddedPiAgentParams,
+  storageConfig: NonNullable<RunEmbeddedPiAgentParams["config"]>["storage"],
+  rawSessionKey: string,
+  responseText: string,
+  started: number,
+): Promise<void> {
+  try {
+    const storageService = getStorageService(storageConfig);
+    await storageService.initialize();
+    const backend = storageService.getBackend(StorageNamespaces.TRANSCRIPTS);
+    const transcriptSessionId = rawSessionKey;
+
+    const supportsConversational = typeof backend.appendConversational === "function";
+
+    if (supportsConversational) {
+      await backend.appendConversational!(
+        StorageNamespaces.TRANSCRIPTS,
+        transcriptSessionId,
+        "user",
+        params.prompt,
+        { source: "webchat" },
+      );
+      await backend.appendConversational!(
+        StorageNamespaces.TRANSCRIPTS,
+        transcriptSessionId,
+        "assistant",
+        responseText,
+        { source: "agentcore" },
+      );
+    } else {
+      const userEntry = {
+        type: "message",
+        id: `user-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        message: {
+          role: "user",
+          content: [{ type: "text", text: params.prompt }],
+          timestamp: started,
+        },
+      };
+      await backend.append(
+        StorageNamespaces.TRANSCRIPTS,
+        transcriptSessionId,
+        JSON.stringify(userEntry),
+      );
+
+      const assistantEntry = {
+        type: "message",
+        id: `assistant-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: responseText }],
+          timestamp: Date.now(),
+          stopReason: "stop",
+          usage: { input: 0, output: 0, totalTokens: 0 },
+        },
+      };
+      await backend.append(
+        StorageNamespaces.TRANSCRIPTS,
+        transcriptSessionId,
+        JSON.stringify(assistantEntry),
+      );
+    }
+    log.info(`agentcore transcript written to storage: session=${transcriptSessionId}`);
+
+    // Update session entry with AgentCore URI so chat.history can read from it
+    const memoryArn = storageConfig?.agentcore?.memoryArn || process.env.AGENTCORE_MEMORY_ARN;
+    if (memoryArn && params.sessionKey) {
+      try {
+        const sessionFileUri = buildAgentCoreTranscriptUri(memoryArn, transcriptSessionId);
+        const agentId = resolveSessionAgentId({
+          sessionKey: params.sessionKey,
+          config: params.config,
+        });
+        const storePath = resolveStorePath(params.config?.session?.store, { agentId });
+        await updateSessionStore(storePath, (store) => {
+          const entry = store[params.sessionKey!];
+          if (entry) {
+            entry.sessionFile = sessionFileUri;
+            entry.updatedAt = Date.now();
+          }
+        });
+        log.info(
+          `agentcore session entry updated with URI: sessionKey=${params.sessionKey} sessionFile=${sessionFileUri}`,
+        );
+      } catch (updateErr) {
+        log.warn(
+          `agentcore session entry update failed: ${updateErr instanceof Error ? updateErr.message : String(updateErr)}`,
+        );
+      }
+    }
+  } catch (err) {
+    log.warn(
+      `agentcore transcript write failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
 
