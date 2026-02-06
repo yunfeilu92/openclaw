@@ -52,8 +52,13 @@ export async function readSessionMessagesAsync(
   sessionFile?: string,
   storageConfig?: StorageConfig,
 ): Promise<unknown[]> {
+  const isAcUri = sessionFile && isAgentCoreUri(sessionFile);
+  console.log(
+    `[agentcore-debug][session-utils] readSessionMessagesAsync: sessionId=${sessionId} sessionFile=${sessionFile ?? "none"} isAgentCoreUri=${!!isAcUri} storageType=${storageConfig?.type ?? "none"}`,
+  );
+
   // If sessionFile is an AgentCore URI, use the async reader
-  if (sessionFile && isAgentCoreUri(sessionFile)) {
+  if (isAcUri) {
     return readTranscriptMessagesFromUri(sessionFile, storageConfig);
   }
 

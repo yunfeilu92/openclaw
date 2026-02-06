@@ -70,6 +70,9 @@ export function createAgentCoreMemoryRecallTool(options: {
     execute: async (_toolCallId, params) => {
       const query = readStringParam(params, "query", { required: true });
       const maxResults = readNumberParam(params, "maxResults") ?? 10;
+      console.log(
+        `[agentcore-debug][memory-recall] query="${query}" maxResults=${maxResults} memoryId=${parsed.memoryId} region=${region} namespace=${namespace}`,
+      );
       try {
         const { BedrockAgentCoreClient, RetrieveMemoryRecordsCommand } =
           await import("@aws-sdk/client-bedrock-agentcore");
@@ -82,9 +85,16 @@ export function createAgentCoreMemoryRecallTool(options: {
         });
         const response = await client.send(command);
         const records = response.memoryRecords ?? [];
+        console.log(`[agentcore-debug][memory-recall] returned ${records.length} records`);
+        for (const r of records) {
+          console.log(
+            `[agentcore-debug][memory-recall]   recordId=${r.recordId} score=${r.score} textLen=${r.content?.text?.length ?? 0}`,
+          );
+        }
         return jsonResult(formatRecallResults(records, query));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        console.log(`[agentcore-debug][memory-recall] ERROR: ${message}`);
         return jsonResult({ results: [], error: message, query });
       }
     },

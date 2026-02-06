@@ -560,6 +560,9 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
    * Append a line to a transcript session.
    */
   async append(namespace: string, key: string, line: string): Promise<void> {
+    console.log(
+      `[agentcore-debug][backend.append] namespace=${namespace} key=${key} sessionId=${this.buildTranscriptSessionId(key)} lineLen=${line.length}`,
+    );
     const client = this.getClient();
     const actorId = this.buildActorId(namespace);
     const sessionId = this.buildTranscriptSessionId(key);
@@ -600,6 +603,9 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
     content: string,
     metadata?: Record<string, string>,
   ): Promise<void> {
+    console.log(
+      `[agentcore-debug][backend.appendConversational] namespace=${namespace} key=${key} role=${role} contentLen=${content.length} sessionId=${this.buildTranscriptSessionId(key)}`,
+    );
     const client = this.getClient();
     const actorId = this.buildActorId(namespace);
     const sessionId = this.buildTranscriptSessionId(key);
@@ -662,8 +668,16 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
     const sessionId = this.buildTranscriptSessionId(key);
     let nextToken: string | undefined;
 
+    console.log(
+      `[agentcore-debug][backend.readLines] START namespace=${namespace} key=${key} actorId=${actorId} sessionId=${sessionId} memoryId=${this.getMemoryId()}`,
+    );
+    let pageNum = 0;
+    let totalEvents = 0;
+    let totalYielded = 0;
+
     try {
       do {
+        pageNum++;
         const command = new ListEventsCommand({
           memoryId: this.getMemoryId(),
           actorId,
@@ -675,12 +689,19 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
 
         const response = await client.send(command);
         const events = response.events ?? [];
+        console.log(
+          `[agentcore-debug][backend.readLines] page=${pageNum} eventsCount=${events.length} hasNextToken=${!!response.nextToken}`,
+        );
 
         for (const event of events as Event[]) {
+          totalEvents++;
           // Iterate through ALL payload items (not just the first one)
           // appendConversational creates events with multiple payloads:
           // [conversational, blob] - we need to find the blob payload
           const payloads = event.payload ?? [];
+          console.log(
+            `[agentcore-debug][backend.readLines] event#${totalEvents} payloadsCount=${payloads.length} eventId=${(event as Record<string, unknown>).eventId ?? "n/a"} eventTimestamp=${(event as Record<string, unknown>).eventTimestamp ?? "n/a"}`,
+          );
           for (const payload of payloads) {
             if (!payload?.blob) {
               continue;
@@ -688,20 +709,28 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
 
             // blob may be a string (from SDK) or a parsed object
             if (typeof payload.blob === "string") {
+              console.log(
+                `[agentcore-debug][backend.readLines] event#${totalEvents} blob is string, len=${payload.blob.length}, preview=${payload.blob.slice(0, 150)}`,
+              );
               // AWS SDK returns blob as Python dict format string
               // Try to extract embedded JSON from text= field
               const extracted = extractJsonFromPythonDict(payload.blob);
               if (extracted) {
+                totalYielded++;
                 yield extracted;
                 continue;
               }
               // Could not extract, yield as-is (might be plain text or old format)
+              totalYielded++;
               yield payload.blob;
               continue;
             }
 
             // blob is already an object (parsed by SDK)
             const blob = payload.blob as Record<string, unknown>;
+            console.log(
+              `[agentcore-debug][backend.readLines] event#${totalEvents} blob is object, _type=${blob._type} keys=${Object.keys(blob).join(",")}`,
+            );
 
             // Convert blob back to JSON line
             let line: string;
@@ -713,6 +742,9 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
                 // JSON data format (legacy)
                 line = typeof blob.data === "string" ? blob.data : JSON.stringify(blob.data);
               } else {
+                console.log(
+                  `[agentcore-debug][backend.readLines] event#${totalEvents} _type=line but no text/data, skipping`,
+                );
                 continue;
               }
             } else {
@@ -721,6 +753,10 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
             }
 
             if (line.trim()) {
+              totalYielded++;
+              console.log(
+                `[agentcore-debug][backend.readLines] yield#${totalYielded} lineLen=${line.length} preview=${line.slice(0, 120)}`,
+              );
               yield line.trim();
             }
           }
@@ -728,8 +764,14 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
 
         nextToken = response.nextToken;
       } while (nextToken);
+      console.log(
+        `[agentcore-debug][backend.readLines] DONE pages=${pageNum} totalEvents=${totalEvents} totalYielded=${totalYielded}`,
+      );
     } catch (err) {
       const errorCode = err && typeof err === "object" && "name" in err ? String(err.name) : null;
+      console.log(
+        `[agentcore-debug][backend.readLines] ERROR code=${errorCode} message=${err instanceof Error ? err.message : String(err)}`,
+      );
 
       // Session not found means no lines exist
       if (errorCode === "ResourceNotFoundException") {

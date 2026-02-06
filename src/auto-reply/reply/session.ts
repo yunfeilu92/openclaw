@@ -27,6 +27,10 @@ import {
   updateSessionStore,
 } from "../../config/sessions.js";
 import { normalizeMainKey } from "../../routing/session-key.js";
+import {
+  buildAgentCoreTranscriptUri,
+  shouldUseAgentCoreTranscripts,
+} from "../../storage/transcript-uri.js";
 import { normalizeSessionDeliveryFields } from "../../utils/delivery-context.js";
 import { resolveCommandAuthorization } from "../command-auth.js";
 import { formatInboundBodyWithSenderMeta } from "./inbound-sender-meta.js";
@@ -327,14 +331,10 @@ export async function initSessionState(params: {
       console.warn(`[session-init] forked session created: file=${forked.sessionFile}`);
     }
   }
-  if (!sessionEntry.sessionFile) {
-    sessionEntry.sessionFile = resolveSessionTranscriptPath(
-      sessionEntry.sessionId,
-      agentId,
-      ctx.MessageThreadId,
-    );
-  }
   if (isNewSession) {
+    // Clear sessionFile first so a fresh path is generated below
+    // (prevents reusing the previous session's AgentCore URI or local file).
+    sessionEntry.sessionFile = undefined;
     sessionEntry.compactionCount = 0;
     sessionEntry.memoryFlushCompactionCount = undefined;
     sessionEntry.memoryFlushAt = undefined;
@@ -344,6 +344,20 @@ export async function initSessionState(params: {
     sessionEntry.inputTokens = undefined;
     sessionEntry.outputTokens = undefined;
     sessionEntry.contextTokens = undefined;
+  }
+  if (!sessionEntry.sessionFile) {
+    if (shouldUseAgentCoreTranscripts(cfg.storage) && cfg.storage?.agentcore?.memoryArn) {
+      sessionEntry.sessionFile = buildAgentCoreTranscriptUri(
+        cfg.storage.agentcore.memoryArn,
+        sessionEntry.sessionId,
+      );
+    } else {
+      sessionEntry.sessionFile = resolveSessionTranscriptPath(
+        sessionEntry.sessionId,
+        agentId,
+        ctx.MessageThreadId,
+      );
+    }
   }
   // Preserve per-session overrides while resetting compaction state on /new.
   sessionStore[sessionKey] = { ...sessionStore[sessionKey], ...sessionEntry };

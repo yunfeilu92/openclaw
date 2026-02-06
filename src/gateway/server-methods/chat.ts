@@ -208,6 +208,10 @@ export const chatHandlers: GatewayRequestHandlers = {
     let rawMessages: unknown[] = [];
     const storageConfig = cfg.storage;
 
+    console.log(
+      `[agentcore-debug][chat.history] sessionKey=${sessionKey} sessionId=${sessionId} sessionFile=${entry?.sessionFile} storageType=${storageConfig?.type ?? "none"}`,
+    );
+
     if (sessionId && storePath) {
       try {
         rawMessages = await readSessionMessagesAsync(
@@ -216,10 +220,16 @@ export const chatHandlers: GatewayRequestHandlers = {
           entry?.sessionFile,
           storageConfig,
         );
+        console.log(
+          `[agentcore-debug][chat.history] readSessionMessagesAsync returned ${rawMessages.length} messages`,
+        );
       } catch (err) {
         // Fallback to synchronous local file reading
         context.logGateway?.warn?.(`Async read failed, falling back to sync: ${err}`);
         rawMessages = readSessionMessages(sessionId, storePath, entry?.sessionFile);
+        console.log(
+          `[agentcore-debug][chat.history] sync fallback returned ${rawMessages.length} messages`,
+        );
       }
     }
 

@@ -59,6 +59,27 @@ function ensureSessionKeyLength(sessionKey: string): string {
 }
 
 /**
+ * Extract the text value from a Python dict string like:
+ *   {'role': 'assistant', 'content': [{'text': "Hello, I'm ..."}]}
+ *
+ * Handles both single- and double-quoted text values.
+ * Returns null if the pattern doesn't match.
+ */
+function extractTextFromPythonDict(s: string): string | null {
+  // Match 'text': "..." (double-quoted — Python uses this when the string contains apostrophes)
+  const dq = s.match(/'text'\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  if (dq) {
+    return dq[1];
+  }
+  // Match 'text': '...' (single-quoted)
+  const sq = s.match(/'text'\s*:\s*'((?:[^'\\]|\\.)*)'/);
+  if (sq) {
+    return sq[1];
+  }
+  return null;
+}
+
+/**
  * Extract response text from AgentCore's various response formats.
  *
  * AgentCore may return responses in different formats:
@@ -79,15 +100,12 @@ function extractResponseText(result: Record<string, unknown>): string {
   // Check response key
   const responseVal = result.response;
   if (responseVal && typeof responseVal === "string") {
-    // If response looks like a Python dict string, try to parse it
+    // If response looks like a Python dict string, extract text via regex
+    // (naive single→double quote replacement breaks on apostrophes like "I'm")
     if (responseVal.trim().startsWith("{")) {
-      try {
-        // Convert Python dict syntax to JSON (single quotes to double quotes)
-        const jsonStr = responseVal.replace(/'/g, '"');
-        const parsed = JSON.parse(jsonStr) as Record<string, unknown>;
-        return extractResponseText(parsed);
-      } catch {
-        // Not valid JSON, return as-is
+      const extracted = extractTextFromPythonDict(responseVal);
+      if (extracted) {
+        return extracted;
       }
     }
     return responseVal;
@@ -180,43 +198,66 @@ export async function runAgentCoreAgent(
         body = String(response.response);
       }
 
+      console.log(`[agentcore-debug][response-parse] raw body (first 500): ${body.slice(0, 500)}`);
       try {
         const result = JSON.parse(body) as Record<string, unknown>;
+        console.log(
+          `[agentcore-debug][response-parse] JSON parsed OK, keys=${Object.keys(result).join(",")}, response type=${typeof result.response}, content type=${typeof result.content}`,
+        );
         responseText = extractResponseText(result);
+        console.log(
+          `[agentcore-debug][response-parse] extractResponseText result (first 200): ${responseText.slice(0, 200)}`,
+        );
       } catch {
-        responseText = body;
+        // body might be a raw Python dict string (single quotes, not valid JSON).
+        // Try to extract text content before falling back to the raw string.
+        const extracted = extractTextFromPythonDict(body);
+        console.log(
+          `[agentcore-debug][response-parse] JSON parse failed, pythonDict extraction=${extracted ? "OK" : "null"}`,
+        );
+        responseText = extracted ?? body;
       }
     }
 
     const durationMs = Date.now() - started;
     log.info(`agentcore invoke complete: session=${sessionKey} duration=${durationMs}ms`);
 
-    // Emit agent events FIRST so webchat/TUI clients receive the response immediately.
-    // Storage writes happen in the background to avoid blocking the UI.
+    // Emit assistant text immediately so webchat/TUI clients see the response.
+    if (params.runId && responseText) {
+      log.info(
+        `agentcore emitting assistant text: runId=${params.runId} textLen=${responseText.length}`,
+      );
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "assistant",
+        data: { text: responseText },
+      });
+    }
+
+    // Write transcript to storage BEFORE emitting lifecycle "end".
+    // The webchat reloads chat.history on "end", so the data must be persisted first.
+    // Use sessionId (unique per session, changes on /new) not sessionKey (stable per user/channel)
+    const storageConfig = params.config?.storage;
+    const isCloudStorage = storageConfig?.type === "hybrid" || storageConfig?.type === "agentcore";
+    const transcriptSessionId = params.sessionId || rawSessionKey;
+    if (isCloudStorage && responseText) {
+      await writeTranscriptToStorage(
+        params,
+        storageConfig,
+        transcriptSessionId,
+        responseText,
+        started,
+      );
+    }
+
+    // Emit lifecycle "end" AFTER transcript is persisted so chat.history sees the data.
     if (params.runId) {
-      if (responseText) {
-        log.info(
-          `agentcore emitting assistant text: runId=${params.runId} textLen=${responseText.length}`,
-        );
-        emitAgentEvent({
-          runId: params.runId,
-          stream: "assistant",
-          data: { text: responseText },
-        });
-      }
       log.info(`agentcore emitting lifecycle end: runId=${params.runId}`);
       emitAgentEvent({
         runId: params.runId,
         stream: "lifecycle",
         data: { phase: "end", startedAt: started, endedAt: Date.now() },
       });
-    }
-
-    // Write transcript to storage in the background (fire-and-forget)
-    const storageConfig = params.config?.storage;
-    const isCloudStorage = storageConfig?.type === "hybrid" || storageConfig?.type === "agentcore";
-    if (isCloudStorage && responseText) {
-      void writeTranscriptToStorage(params, storageConfig, rawSessionKey, responseText, started);
     }
 
     // Call streaming callbacks if provided
@@ -282,7 +323,7 @@ export async function runAgentCoreAgent(
 async function writeTranscriptToStorage(
   params: RunEmbeddedPiAgentParams,
   storageConfig: NonNullable<RunEmbeddedPiAgentParams["config"]>["storage"],
-  rawSessionKey: string,
+  transcriptSessionId: string,
   responseText: string,
   started: number,
 ): Promise<void> {
@@ -290,9 +331,11 @@ async function writeTranscriptToStorage(
     const storageService = getStorageService(storageConfig);
     await storageService.initialize();
     const backend = storageService.getBackend(StorageNamespaces.TRANSCRIPTS);
-    const transcriptSessionId = rawSessionKey;
 
     const supportsConversational = typeof backend.appendConversational === "function";
+    console.log(
+      `[agentcore-debug][provider.writeTranscript] transcriptSessionId=${transcriptSessionId} supportsConversational=${supportsConversational} backendType=${backend.type} promptLen=${params.prompt.length} responseLen=${responseText.length}`,
+    );
 
     if (supportsConversational) {
       await backend.appendConversational!(
@@ -348,9 +391,13 @@ async function writeTranscriptToStorage(
 
     // Update session entry with AgentCore URI so chat.history can read from it
     const memoryArn = storageConfig?.agentcore?.memoryArn || process.env.AGENTCORE_MEMORY_ARN;
+    console.log(
+      `[agentcore-debug][provider.writeTranscript] updating session entry: memoryArn=${memoryArn ?? "none"} sessionKey=${params.sessionKey ?? "none"}`,
+    );
     if (memoryArn && params.sessionKey) {
       try {
         const sessionFileUri = buildAgentCoreTranscriptUri(memoryArn, transcriptSessionId);
+        console.log(`[agentcore-debug][provider.writeTranscript] sessionFileUri=${sessionFileUri}`);
         const agentId = resolveSessionAgentId({
           sessionKey: params.sessionKey,
           config: params.config,
