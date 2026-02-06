@@ -286,6 +286,11 @@
       "title": "Memory Get",
       "detailKeys": ["path", "from", "lines"]
     },
+    "agentcore_memory_recall": {
+      "emoji": "🔮",
+      "title": "Memory Recall",
+      "detailKeys": ["query", "maxResults"]
+    },
     "web_search": {
       "emoji": "🔎",
       "title": "Web Search",

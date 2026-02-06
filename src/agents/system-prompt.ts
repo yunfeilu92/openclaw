@@ -45,18 +45,32 @@ function buildMemorySection(params: {
   if (params.isMinimal) {
     return [];
   }
-  if (!params.availableTools.has("memory_search") && !params.availableTools.has("memory_get")) {
+  const hasLocalMemory =
+    params.availableTools.has("memory_search") || params.availableTools.has("memory_get");
+  const hasAgentCoreRecall = params.availableTools.has("agentcore_memory_recall");
+  if (!hasLocalMemory && !hasAgentCoreRecall) {
     return [];
   }
-  const lines = [
-    "## Memory Recall",
-    "Before answering anything about prior work, decisions, dates, people, preferences, or todos: run memory_search on MEMORY.md + memory/*.md; then use memory_get to pull only the needed lines. If low confidence after search, say you checked.",
-  ];
+  const lines = ["## Memory Recall"];
+  if (hasLocalMemory) {
+    lines.push(
+      "Before answering anything about prior work, decisions, dates, people, preferences, or todos: run memory_search on MEMORY.md + memory/*.md; then use memory_get to pull only the needed lines. If low confidence after search, say you checked.",
+    );
+    if (hasAgentCoreRecall) {
+      lines.push(
+        "Also use agentcore_memory_recall when local memory lacks results or when recalling cross-session context and long-term facts.",
+      );
+    }
+  } else if (hasAgentCoreRecall) {
+    lines.push(
+      "Use agentcore_memory_recall to recall prior facts, user preferences, and cross-session context from long-term memory.",
+    );
+  }
   if (params.citationsMode === "off") {
     lines.push(
       "Citations are disabled: do not mention file paths or line numbers in replies unless the user explicitly asks.",
     );
-  } else {
+  } else if (hasLocalMemory) {
     lines.push(
       "Citations: include Source: <path#line> when it helps the user verify memory snippets.",
     );
