@@ -127,6 +127,8 @@ export async function readTranscriptMessagesFromUri(
     }
   }
 
+  // AgentCore ListEvents returns newest-first; reverse to chronological order.
+  messages.reverse();
   return messages;
 }
 

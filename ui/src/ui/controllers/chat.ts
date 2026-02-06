@@ -41,13 +41,7 @@ export async function loadChatHistory(state: ChatState) {
         limit: 200,
       },
     );
-    const fetched = Array.isArray(res.messages) ? res.messages : [];
-    // Only replace if the server returned at least as many messages as
-    // we currently hold (which may include an optimistic final message).
-    // This prevents a stale read from wiping a message the user just saw.
-    if (fetched.length >= state.chatMessages.length) {
-      state.chatMessages = fetched;
-    }
+    state.chatMessages = Array.isArray(res.messages) ? res.messages : [];
     state.chatThinkingLevel = res.thinkingLevel ?? null;
   } catch (err) {
     state.lastError = String(err);
@@ -208,6 +202,8 @@ export function handleChatEvent(state: ChatState, payload?: ChatEventPayload) {
     state.chatStream = null;
     state.chatRunId = null;
     state.chatStreamStartedAt = null;
+    // Signal that we already appended — caller should skip loadChatHistory.
+    return payload.message ? "final-optimistic" : "final";
   } else if (payload.state === "aborted") {
     state.chatStream = null;
     state.chatRunId = null;
