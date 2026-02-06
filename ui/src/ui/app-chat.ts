@@ -181,6 +181,10 @@ export async function handleSendChat(
   }
 
   const refreshSessions = isChatResetCommand(message);
+  if (refreshSessions) {
+    // Immediately clear chat history so the user sees a blank slate.
+    (host as unknown as { chatMessages: unknown[] }).chatMessages = [];
+  }
   if (messageOverride == null) {
     host.chatMessage = "";
     // Clear attachments when sending

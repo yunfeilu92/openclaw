@@ -199,11 +199,13 @@ function handleGatewayEventUnsafe(host: GatewayHost, evt: GatewayEventFrame) {
     }
     const state = handleChatEvent(host as unknown as OpenClawApp, payload);
     const isFinal = state === "final" || state === "final-optimistic";
+    let isSessionReset = false;
     if (isFinal || state === "error" || state === "aborted") {
       resetToolStream(host as unknown as Parameters<typeof resetToolStream>[0]);
       void flushChatQueueForEvent(host as unknown as Parameters<typeof flushChatQueueForEvent>[0]);
       const runId = payload?.runId;
       if (runId && host.refreshSessionsAfterChat.has(runId)) {
+        isSessionReset = true;
         host.refreshSessionsAfterChat.delete(runId);
         if (isFinal) {
           void loadSessions(host as unknown as OpenClawApp, {
@@ -212,8 +214,9 @@ function handleGatewayEventUnsafe(host: GatewayHost, evt: GatewayEventFrame) {
         }
       }
     }
-    if (state === "final") {
-      // Only reload history when no optimistic append (e.g. other run's final).
+    if (state === "final" || (state === "final-optimistic" && isSessionReset)) {
+      // Reload history: always after session reset (/new); otherwise only when
+      // no optimistic append happened (e.g. another run's final event).
       void loadChatHistory(host as unknown as OpenClawApp);
     }
     return;
