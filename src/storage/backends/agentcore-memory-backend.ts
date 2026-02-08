@@ -403,9 +403,18 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
       return value;
     } catch (err) {
       const errorCode = err && typeof err === "object" && "name" in err ? String(err.name) : null;
+      const errorMessage = err instanceof Error ? err.message : String(err);
 
-      // Session not found means key doesn't exist
+      // Session/actor not found means key doesn't exist
       if (errorCode === "ResourceNotFoundException") {
+        return null;
+      }
+      // Actor not yet created (no events ever written for this namespace)
+      if (errorMessage.includes("Actor") && errorMessage.includes("not found")) {
+        return null;
+      }
+      // ValidationException when actor doesn't exist yet
+      if (errorCode === "ValidationException") {
         return null;
       }
       throw err;
@@ -502,28 +511,43 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
     const keys: string[] = [];
     let nextToken: string | undefined;
 
-    do {
-      const command = new ListSessionsCommand({
-        memoryId: this.getMemoryId(),
-        actorId,
-        maxResults: 100,
-        nextToken,
-      });
+    try {
+      do {
+        const command = new ListSessionsCommand({
+          memoryId: this.getMemoryId(),
+          actorId,
+          maxResults: 100,
+          nextToken,
+        });
 
-      const response = await client.send(command);
-      const sessions = response.sessionSummaries ?? [];
+        const response = await client.send(command);
+        const sessions = response.sessionSummaries ?? [];
 
-      for (const session of sessions) {
-        if (session.sessionId?.startsWith(KV_SESSION_PREFIX)) {
-          const key = session.sessionId.slice(KV_SESSION_PREFIX.length);
-          if (!prefix || key.startsWith(prefix)) {
-            keys.push(key);
+        for (const session of sessions) {
+          if (session.sessionId?.startsWith(KV_SESSION_PREFIX)) {
+            const key = session.sessionId.slice(KV_SESSION_PREFIX.length);
+            if (!prefix || key.startsWith(prefix)) {
+              keys.push(key);
+            }
           }
         }
-      }
 
-      nextToken = response.nextToken;
-    } while (nextToken);
+        nextToken = response.nextToken;
+      } while (nextToken);
+    } catch (err) {
+      const errorCode = err && typeof err === "object" && "name" in err ? String(err.name) : null;
+      const errorMessage = err instanceof Error ? err.message : String(err);
+
+      // Actor not found = no events ever written for this namespace, return empty
+      if (
+        errorCode === "ResourceNotFoundException" ||
+        errorCode === "ValidationException" ||
+        (errorMessage.includes("Actor") && errorMessage.includes("not found"))
+      ) {
+        return [];
+      }
+      throw err;
+    }
 
     return keys;
   }
