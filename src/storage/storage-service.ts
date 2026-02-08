@@ -55,6 +55,9 @@ function resolveClassification(
       case StorageNamespaces.CONFIG:
         if (classification.config) return classification.config;
         break;
+      case StorageNamespaces.WORKSPACE:
+        if (classification.workspace) return classification.workspace;
+        break;
     }
   }
 
@@ -66,7 +69,8 @@ function resolveClassification(
         return "cloud";
       case StorageNamespaces.AUTH:
       case StorageNamespaces.CONFIG:
-        return "local"; // Auth and config stay local by default
+      case StorageNamespaces.WORKSPACE:
+        return "local"; // Auth, config, and workspace stay local by default
     }
   }
 
@@ -132,8 +136,11 @@ export class StorageService implements IStorageService {
           return this.getAgentCoreBackend();
         }
       }
-      if (namespace === StorageNamespaces.TRANSCRIPTS) {
-        // Transcripts go to AgentCore Memory for append-only storage
+      if (
+        namespace === StorageNamespaces.TRANSCRIPTS ||
+        namespace === StorageNamespaces.WORKSPACE
+      ) {
+        // Transcripts and workspace files go to AgentCore Memory
         if (this.config.agentcore?.memoryArn) {
           return this.getAgentCoreBackend();
         }
@@ -307,6 +314,7 @@ export class StorageService implements IStorageService {
       [StorageNamespaces.TRANSCRIPTS]: { ok: false, error: "not checked" },
       [StorageNamespaces.AUTH]: { ok: false, error: "not checked" },
       [StorageNamespaces.CONFIG]: { ok: false, error: "not checked" },
+      [StorageNamespaces.WORKSPACE]: { ok: false, error: "not checked" },
     };
 
     // Check each namespace's backend

@@ -13,6 +13,8 @@ import {
   BedrockAgentCoreClient,
   InvokeAgentRuntimeCommand,
 } from "@aws-sdk/client-bedrock-agentcore";
+import type { StorageConfig } from "../config/types.storage.js";
+import type { EmbeddedContextFile } from "./pi-embedded-helpers/types.js";
 import type { RunEmbeddedPiAgentParams } from "./pi-embedded-runner/run/params.js";
 import type { EmbeddedPiRunResult } from "./pi-embedded-runner/types.js";
 import { resolveStorePath } from "../config/sessions/paths.js";
@@ -22,7 +24,11 @@ import { getStorageService } from "../storage/storage-service.js";
 import { buildAgentCoreTranscriptUri } from "../storage/transcript-uri.js";
 import { StorageNamespaces } from "../storage/types.js";
 import { resolveSessionAgentId } from "./agent-scope.js";
+import { resolveBootstrapContextForRun } from "./bootstrap-files.js";
 import { log } from "./pi-embedded-runner/logger.js";
+import { buildAgentSystemPrompt } from "./system-prompt.js";
+import { createAgentCoreMemoryRecallTool } from "./tools/agentcore-memory-tool.js";
+import { ensureCloudWorkspace, resolveWorkspaceClassification } from "./workspace.js";
 
 // AgentCore configuration from environment
 const AGENTCORE_RUNTIME_ARN =
@@ -120,6 +126,98 @@ function extractResponseText(result: Record<string, unknown>): string {
 }
 
 /**
+ * Build context (workspace files, memory, system prompt) for an AgentCore request.
+ * Best-effort: failures are logged but do not block the request.
+ */
+async function buildAgentCoreContext(params: RunEmbeddedPiAgentParams): Promise<{
+  systemPrompt: string;
+  contextFiles: EmbeddedContextFile[];
+  memoryContext: string | null;
+}> {
+  // 0. Ensure cloud workspace is seeded (no-op if already populated or if local)
+  if (resolveWorkspaceClassification(params.config?.storage) === "cloud") {
+    try {
+      const svc = getStorageService(params.config?.storage);
+      await svc.initialize();
+      await ensureCloudWorkspace(svc);
+    } catch (err) {
+      log.warn(
+        `agentcore context: cloud workspace seed failed (non-blocking): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // 1. Load workspace context files (SOUL.md, AGENTS.md, TOOLS.md, etc.)
+  let contextFiles: EmbeddedContextFile[] = [];
+  try {
+    const bootstrap = await resolveBootstrapContextForRun({
+      workspaceDir: params.workspaceDir,
+      config: params.config,
+      sessionKey: params.sessionKey,
+      sessionId: params.sessionId,
+    });
+    contextFiles = bootstrap.contextFiles;
+    log.debug(`agentcore context: loaded ${contextFiles.length} workspace files`);
+  } catch (err) {
+    log.warn(
+      `agentcore context: failed to load workspace files: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // 2. Pre-fetch memory (best-effort, 3s timeout)
+  let memoryContext: string | null = null;
+  try {
+    const memoryTool = createAgentCoreMemoryRecallTool({ config: params.config });
+    if (memoryTool) {
+      const recallPromise = memoryTool.execute("prefetch", {
+        query: params.prompt,
+        maxResults: 5,
+      });
+      const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000));
+      const result = await Promise.race([recallPromise, timeoutPromise]);
+      if (result && typeof result === "object" && "content" in result) {
+        // content is (TextContent | ImageContent)[]; extract text from first text block
+        const contentArr = (result as { content: Array<{ type: string; text?: string }> }).content;
+        const textBlock = contentArr?.find((c) => c.type === "text" && c.text);
+        if (textBlock?.text) {
+          const parsed = JSON.parse(textBlock.text);
+          if (parsed.results && Array.isArray(parsed.results) && parsed.results.length > 0) {
+            memoryContext = parsed.results
+              .map((r: { text: string; score?: number }) => r.text)
+              .join("\n---\n");
+            log.debug(`agentcore context: pre-fetched ${parsed.results.length} memory records`);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    log.warn(
+      `agentcore context: memory pre-fetch failed (non-blocking): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // 3. Build system prompt with memory recall instructions + context files
+  const toolNames = ["agentcore_memory_recall"];
+  let systemPrompt: string;
+  try {
+    systemPrompt = buildAgentSystemPrompt({
+      workspaceDir: params.workspaceDir,
+      toolNames,
+      contextFiles,
+      extraSystemPrompt: params.extraSystemPrompt,
+      ownerNumbers: params.ownerNumbers,
+    });
+  } catch (err) {
+    log.warn(
+      `agentcore context: system prompt build failed, using fallback: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    systemPrompt = "You are a personal assistant running inside OpenClaw.";
+  }
+
+  return { systemPrompt, contextFiles, memoryContext };
+}
+
+/**
  * Run an agent turn using AgentCore Runtime.
  *
  * This function provides the same interface as runEmbeddedPiAgent
@@ -135,10 +233,20 @@ export async function runAgentCoreAgent(
   const rawSessionKey = params.sessionKey || params.sessionId;
   const sessionKey = ensureSessionKeyLength(rawSessionKey);
 
+  // Build context: workspace files, memory pre-fetch, system prompt
+  const { systemPrompt, contextFiles, memoryContext } = await buildAgentCoreContext(params);
+
+  // Enrich prompt with pre-fetched memory (fallback for servers that ignore system_prompt)
+  let enrichedPrompt = params.prompt;
+  if (memoryContext) {
+    enrichedPrompt = `[Recalled Memory]\n${memoryContext}\n\n[User Message]\n${params.prompt}`;
+  }
+
   // Build AgentCore payload
   const payload = {
-    prompt: params.prompt,
+    prompt: enrichedPrompt,
     session_id: sessionKey,
+    system_prompt: systemPrompt,
     context: {
       channel: params.messageChannel || params.messageProvider || "api",
       agent_id: params.agentAccountId || "main",
@@ -146,10 +254,12 @@ export async function runAgentCoreAgent(
       is_group: !!params.groupId,
       group_id: params.groupId || undefined,
     },
+    context_files: contextFiles.map((f) => ({ path: f.path, content: f.content })),
+    ...(memoryContext ? { memory_context: memoryContext } : {}),
   };
 
   log.info(
-    `agentcore invoke start: session=${sessionKey} channel=${payload.context.channel} runId=${params.runId || "none"}`,
+    `agentcore invoke start: session=${sessionKey} channel=${payload.context.channel} runId=${params.runId || "none"} contextFiles=${contextFiles.length} hasMemory=${!!memoryContext}`,
   );
 
   // Emit lifecycle start event
@@ -177,6 +287,7 @@ export async function runAgentCoreAgent(
 
     // Parse response from StreamingBody
     let responseText = "";
+    let workspaceUpdates: WorkspaceUpdate[] = [];
     if (response.response) {
       // response is a Readable stream or has transformToString
       let body: string;
@@ -198,22 +309,30 @@ export async function runAgentCoreAgent(
         body = String(response.response);
       }
 
-      console.log(`[agentcore-debug][response-parse] raw body (first 500): ${body.slice(0, 500)}`);
+      log.debug(`agentcore response-parse: raw body (first 500): ${body.slice(0, 500)}`);
       try {
         const result = JSON.parse(body) as Record<string, unknown>;
-        console.log(
-          `[agentcore-debug][response-parse] JSON parsed OK, keys=${Object.keys(result).join(",")}, response type=${typeof result.response}, content type=${typeof result.content}`,
+        log.debug(
+          `agentcore response-parse: JSON parsed OK, keys=${Object.keys(result).join(",")}, response type=${typeof result.response}, content type=${typeof result.content}`,
         );
         responseText = extractResponseText(result);
-        console.log(
-          `[agentcore-debug][response-parse] extractResponseText result (first 200): ${responseText.slice(0, 200)}`,
+        log.debug(
+          `agentcore response-parse: extracted text (first 200): ${responseText.slice(0, 200)}`,
         );
+        // Extract workspace_updates if present
+        if (Array.isArray(result.workspace_updates)) {
+          workspaceUpdates = (result.workspace_updates as WorkspaceUpdate[]).filter(
+            (u) =>
+              typeof u.filename === "string" &&
+              (typeof u.content === "string" || u.content === null),
+          );
+        }
       } catch {
         // body might be a raw Python dict string (single quotes, not valid JSON).
         // Try to extract text content before falling back to the raw string.
         const extracted = extractTextFromPythonDict(body);
-        console.log(
-          `[agentcore-debug][response-parse] JSON parse failed, pythonDict extraction=${extracted ? "OK" : "null"}`,
+        log.debug(
+          `agentcore response-parse: JSON parse failed, pythonDict extraction=${extracted ? "OK" : "null"}`,
         );
         responseText = extracted ?? body;
       }
@@ -248,6 +367,17 @@ export async function runAgentCoreAgent(
         responseText,
         started,
       );
+    }
+
+    // Persist workspace file updates from AgentCore response (best-effort)
+    if (workspaceUpdates.length > 0) {
+      try {
+        await persistWorkspaceUpdates(storageConfig, workspaceUpdates);
+      } catch (err) {
+        log.warn(
+          `agentcore workspace update failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
 
     // Emit lifecycle "end" AFTER transcript is persisted so chat.history sees the data.
@@ -333,8 +463,8 @@ async function writeTranscriptToStorage(
     const backend = storageService.getBackend(StorageNamespaces.TRANSCRIPTS);
 
     const supportsConversational = typeof backend.appendConversational === "function";
-    console.log(
-      `[agentcore-debug][provider.writeTranscript] transcriptSessionId=${transcriptSessionId} supportsConversational=${supportsConversational} backendType=${backend.type} promptLen=${params.prompt.length} responseLen=${responseText.length}`,
+    log.debug(
+      `agentcore writeTranscript: transcriptSessionId=${transcriptSessionId} supportsConversational=${supportsConversational} backendType=${backend.type} promptLen=${params.prompt.length} responseLen=${responseText.length}`,
     );
 
     if (supportsConversational) {
@@ -391,13 +521,13 @@ async function writeTranscriptToStorage(
 
     // Update session entry with AgentCore URI so chat.history can read from it
     const memoryArn = storageConfig?.agentcore?.memoryArn || process.env.AGENTCORE_MEMORY_ARN;
-    console.log(
-      `[agentcore-debug][provider.writeTranscript] updating session entry: memoryArn=${memoryArn ?? "none"} sessionKey=${params.sessionKey ?? "none"}`,
+    log.debug(
+      `agentcore writeTranscript: updating session entry: memoryArn=${memoryArn ?? "none"} sessionKey=${params.sessionKey ?? "none"}`,
     );
     if (memoryArn && params.sessionKey) {
       try {
         const sessionFileUri = buildAgentCoreTranscriptUri(memoryArn, transcriptSessionId);
-        console.log(`[agentcore-debug][provider.writeTranscript] sessionFileUri=${sessionFileUri}`);
+        log.debug(`agentcore writeTranscript: sessionFileUri=${sessionFileUri}`);
         const agentId = resolveSessionAgentId({
           sessionKey: params.sessionKey,
           config: params.config,
@@ -424,6 +554,37 @@ async function writeTranscriptToStorage(
       `agentcore transcript write failed: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+}
+
+/**
+ * Workspace file update from AgentCore agent response.
+ * content=null means the file should be deleted.
+ */
+type WorkspaceUpdate = { filename: string; content: string | null };
+
+/**
+ * Persist workspace file updates from AgentCore response to cloud storage.
+ * No-op when workspace classification is not "cloud".
+ */
+async function persistWorkspaceUpdates(
+  storageConfig: StorageConfig | undefined,
+  updates: WorkspaceUpdate[],
+): Promise<void> {
+  if (!updates.length) return;
+  if (resolveWorkspaceClassification(storageConfig) !== "cloud") return;
+
+  const svc = getStorageService(storageConfig);
+  await svc.initialize();
+  const backend = svc.getBackend(StorageNamespaces.WORKSPACE);
+
+  for (const u of updates) {
+    if (u.content === null) {
+      await backend.delete(StorageNamespaces.WORKSPACE, u.filename);
+    } else {
+      await backend.set(StorageNamespaces.WORKSPACE, u.filename, u.content);
+    }
+  }
+  log.info(`agentcore workspace: persisted ${updates.length} file update(s)`);
 }
 
 /**

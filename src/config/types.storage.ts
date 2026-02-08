@@ -21,6 +21,8 @@ export type DataClassificationConfig = {
   auth?: DataClassification;
   /** Configuration data (default: "local") */
   config?: DataClassification;
+  /** Workspace files — SOUL.md, AGENTS.md, etc. (default: "local") */
+  workspace?: DataClassification;
 };
 
 /**

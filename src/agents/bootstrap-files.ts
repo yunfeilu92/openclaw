@@ -1,10 +1,13 @@
 import type { OpenClawConfig } from "../config/config.js";
 import type { EmbeddedContextFile } from "./pi-embedded-helpers.js";
+import { getStorageService } from "../storage/storage-service.js";
 import { applyBootstrapHookOverrides } from "./bootstrap-hooks.js";
 import { buildBootstrapContextFiles, resolveBootstrapMaxChars } from "./pi-embedded-helpers.js";
 import {
   filterBootstrapFilesForSession,
   loadWorkspaceBootstrapFiles,
+  loadWorkspaceBootstrapFilesFromCloud,
+  resolveWorkspaceClassification,
   type WorkspaceBootstrapFile,
 } from "./workspace.js";
 
@@ -26,10 +29,19 @@ export async function resolveBootstrapFilesForRun(params: {
   agentId?: string;
 }): Promise<WorkspaceBootstrapFile[]> {
   const sessionKey = params.sessionKey ?? params.sessionId;
-  const bootstrapFiles = filterBootstrapFilesForSession(
-    await loadWorkspaceBootstrapFiles(params.workspaceDir),
-    sessionKey,
-  );
+
+  // Branch: cloud workspace reads from StorageService, local reads from disk
+  const isCloud = resolveWorkspaceClassification(params.config?.storage) === "cloud";
+  let rawFiles: WorkspaceBootstrapFile[];
+  if (isCloud) {
+    const svc = getStorageService(params.config?.storage);
+    await svc.initialize();
+    rawFiles = await loadWorkspaceBootstrapFilesFromCloud(svc);
+  } else {
+    rawFiles = await loadWorkspaceBootstrapFiles(params.workspaceDir);
+  }
+
+  const bootstrapFiles = filterBootstrapFilesForSession(rawFiles, sessionKey);
   return applyBootstrapHookOverrides({
     files: bootstrapFiles,
     workspaceDir: params.workspaceDir,

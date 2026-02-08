@@ -1,8 +1,12 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { StorageConfig } from "../config/types.storage.js";
+import type { DataClassification } from "../storage/types.js";
+import type { IStorageService } from "../storage/types.js";
 import { runCommandWithTimeout } from "../process/exec.js";
 import { isSubagentSessionKey } from "../routing/session-key.js";
+import { StorageNamespaces } from "../storage/types.js";
 import { resolveUserPath } from "../utils.js";
 import { resolveWorkspaceTemplateDir } from "./workspace-templates.js";
 
@@ -300,4 +304,73 @@ export function filterBootstrapFilesForSession(
     return files;
   }
   return files.filter((file) => SUBAGENT_BOOTSTRAP_ALLOWLIST.has(file.name));
+}
+
+/**
+ * Resolve workspace data classification from storage config.
+ * Returns "cloud" only when explicitly configured; defaults to "local".
+ */
+export function resolveWorkspaceClassification(storageConfig?: StorageConfig): DataClassification {
+  if (!storageConfig) return "local";
+  return storageConfig.dataClassification?.workspace ?? "local";
+}
+
+/** All standard workspace bootstrap file names (excluding memory). */
+const WORKSPACE_FILE_NAMES: WorkspaceBootstrapFileName[] = [
+  DEFAULT_AGENTS_FILENAME,
+  DEFAULT_SOUL_FILENAME,
+  DEFAULT_TOOLS_FILENAME,
+  DEFAULT_IDENTITY_FILENAME,
+  DEFAULT_USER_FILENAME,
+  DEFAULT_HEARTBEAT_FILENAME,
+  DEFAULT_BOOTSTRAP_FILENAME,
+];
+
+/**
+ * Load workspace bootstrap files from cloud storage (AgentCore Memory KV).
+ * Mirrors the local `loadWorkspaceBootstrapFiles()` but reads from StorageService.
+ */
+export async function loadWorkspaceBootstrapFilesFromCloud(
+  storageService: IStorageService,
+): Promise<WorkspaceBootstrapFile[]> {
+  const backend = storageService.getBackend(StorageNamespaces.WORKSPACE);
+  const result: WorkspaceBootstrapFile[] = [];
+
+  for (const name of WORKSPACE_FILE_NAMES) {
+    const content = await backend.get<string>(StorageNamespaces.WORKSPACE, name);
+    result.push(
+      content != null
+        ? { name, path: `cloud://workspace/${name}`, content, missing: false }
+        : { name, path: `cloud://workspace/${name}`, missing: true },
+    );
+  }
+
+  // Memory files (optional, include only when present)
+  const memoryNames: WorkspaceBootstrapFileName[] = [
+    DEFAULT_MEMORY_FILENAME,
+    DEFAULT_MEMORY_ALT_FILENAME,
+  ];
+  for (const memName of memoryNames) {
+    const content = await backend.get<string>(StorageNamespaces.WORKSPACE, memName);
+    if (content != null) {
+      result.push({ name: memName, path: `cloud://workspace/${memName}`, content, missing: false });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Ensure cloud workspace has bootstrap files seeded from templates.
+ * Called before first run in cloud mode. No-op if any workspace files already exist.
+ */
+export async function ensureCloudWorkspace(storageService: IStorageService): Promise<void> {
+  const backend = storageService.getBackend(StorageNamespaces.WORKSPACE);
+  const existing = await backend.list(StorageNamespaces.WORKSPACE);
+  if (existing.length > 0) return; // already seeded
+
+  for (const name of WORKSPACE_FILE_NAMES) {
+    const content = await loadTemplate(name);
+    await backend.set(StorageNamespaces.WORKSPACE, name, content);
+  }
 }

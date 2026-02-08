@@ -172,6 +172,8 @@ export const StorageNamespaces = {
   AUTH: "auth",
   /** Configuration data */
   CONFIG: "config",
+  /** Workspace files (SOUL.md, AGENTS.md, etc.) */
+  WORKSPACE: "workspace",
 } as const;
 
 export type StorageNamespace = (typeof StorageNamespaces)[keyof typeof StorageNamespaces];

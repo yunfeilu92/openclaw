@@ -14,6 +14,7 @@ export const DataClassificationConfigSchema = z
     transcripts: DataClassificationSchema.optional(),
     auth: DataClassificationSchema.optional(),
     config: DataClassificationSchema.optional(),
+    workspace: DataClassificationSchema.optional(),
   })
   .strict()
   .optional();
