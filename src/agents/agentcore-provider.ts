@@ -218,6 +218,69 @@ async function buildAgentCoreContext(params: RunEmbeddedPiAgentParams): Promise<
 }
 
 /**
+ * Load recent transcript history from storage for passing to AgentCore Runtime.
+ * Returns an array of {role, content} messages in chronological order.
+ * Best-effort: returns empty array on failure.
+ */
+async function loadRecentTranscriptHistory(
+  storageConfig: StorageConfig | undefined,
+  transcriptSessionId: string,
+  limit = 20,
+): Promise<Array<{ role: string; content: string }>> {
+  try {
+    const isCloudStorage = storageConfig?.type === "hybrid" || storageConfig?.type === "agentcore";
+    if (!isCloudStorage) return [];
+
+    const storageService = getStorageService(storageConfig);
+    await storageService.initialize();
+    const backend = storageService.getBackend(StorageNamespaces.TRANSCRIPTS);
+
+    const allMessages: Array<{ role: string; content: string }> = [];
+
+    for await (const line of backend.readLines(
+      StorageNamespaces.TRANSCRIPTS,
+      transcriptSessionId,
+    )) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        const msg = entry?.message;
+        if (!msg?.role) continue;
+        // Extract text from content (string or content array)
+        let text: string;
+        if (typeof msg.content === "string") {
+          text = msg.content;
+        } else if (Array.isArray(msg.content)) {
+          text =
+            msg.content
+              .filter((c: { type?: string; text?: string }) => c.type === "text" && c.text)
+              .map((c: { text: string }) => c.text)
+              .join("\n") || "";
+        } else {
+          continue;
+        }
+        if (text) {
+          allMessages.push({ role: msg.role, content: text });
+        }
+      } catch {
+        // skip bad lines
+      }
+    }
+
+    // AgentCore readLines returns newest-first; reverse to chronological
+    allMessages.reverse();
+
+    // Return only the most recent N messages
+    return allMessages.slice(-limit);
+  } catch (err) {
+    log.warn(
+      `agentcore loadTranscriptHistory failed (non-blocking): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return [];
+  }
+}
+
+/**
  * Run an agent turn using AgentCore Runtime.
  *
  * This function provides the same interface as runEmbeddedPiAgent
@@ -231,10 +294,17 @@ export async function runAgentCoreAgent(
 
   // Build session key (must be at least 33 characters)
   const rawSessionKey = params.sessionKey || params.sessionId;
-  const sessionKey = ensureSessionKeyLength(rawSessionKey);
+  // Use transcriptSessionId (changes on /new) for both transcript and AgentCore session
+  // so that /new truly resets the conversation history.
+  const transcriptSessionId = params.sessionId || rawSessionKey;
+  const agentCoreSessionId = ensureSessionKeyLength(transcriptSessionId);
 
   // Build context: workspace files, memory pre-fetch, system prompt
   const { systemPrompt, contextFiles, memoryContext } = await buildAgentCoreContext(params);
+
+  // Load recent conversation history from transcript storage
+  const storageConfig = params.config?.storage;
+  const history = await loadRecentTranscriptHistory(storageConfig, transcriptSessionId);
 
   // Enrich prompt with pre-fetched memory (fallback for servers that ignore system_prompt)
   let enrichedPrompt = params.prompt;
@@ -243,9 +313,14 @@ export async function runAgentCoreAgent(
   }
 
   // Build AgentCore payload
+  // - prompt: enriched with recalled memory (for the current agent turn)
+  // - raw_prompt: original user message (for saving to session history)
+  // - history: recent conversation history from Gateway transcript (replaces Python session_manager)
   const payload = {
     prompt: enrichedPrompt,
-    session_id: sessionKey,
+    raw_prompt: params.prompt,
+    session_id: agentCoreSessionId,
+    history,
     system_prompt: systemPrompt,
     context: {
       channel: params.messageChannel || params.messageProvider || "api",
@@ -259,7 +334,7 @@ export async function runAgentCoreAgent(
   };
 
   log.info(
-    `agentcore invoke start: session=${sessionKey} channel=${payload.context.channel} runId=${params.runId || "none"} contextFiles=${contextFiles.length} hasMemory=${!!memoryContext}`,
+    `agentcore invoke start: session=${agentCoreSessionId} transcript=${transcriptSessionId} channel=${payload.context.channel} runId=${params.runId || "none"} contextFiles=${contextFiles.length} hasMemory=${!!memoryContext} historyLen=${history.length}`,
   );
 
   // Emit lifecycle start event
@@ -277,7 +352,7 @@ export async function runAgentCoreAgent(
   try {
     const command = new InvokeAgentRuntimeCommand({
       agentRuntimeArn: AGENTCORE_RUNTIME_ARN,
-      runtimeSessionId: sessionKey,
+      runtimeSessionId: agentCoreSessionId,
       payload: Buffer.from(JSON.stringify(payload)),
       contentType: "application/json",
       accept: "application/json",
@@ -347,7 +422,7 @@ export async function runAgentCoreAgent(
     }
 
     const durationMs = Date.now() - started;
-    log.info(`agentcore invoke complete: session=${sessionKey} duration=${durationMs}ms`);
+    log.info(`agentcore invoke complete: session=${agentCoreSessionId} duration=${durationMs}ms`);
 
     // Emit assistant text immediately so webchat/TUI clients see the response.
     if (params.runId && responseText) {
@@ -363,10 +438,7 @@ export async function runAgentCoreAgent(
 
     // Write transcript to storage BEFORE emitting lifecycle "end".
     // The webchat reloads chat.history on "end", so the data must be persisted first.
-    // Use sessionId (unique per session, changes on /new) not sessionKey (stable per user/channel)
-    const storageConfig = params.config?.storage;
     const isCloudStorage = storageConfig?.type === "hybrid" || storageConfig?.type === "agentcore";
-    const transcriptSessionId = params.sessionId || rawSessionKey;
     if (isCloudStorage && responseText) {
       await writeTranscriptToStorage(
         params,
@@ -411,7 +483,7 @@ export async function runAgentCoreAgent(
       meta: {
         durationMs,
         agentMeta: {
-          sessionId: sessionKey,
+          sessionId: agentCoreSessionId,
           provider: "agentcore",
           model: "claude-3-5-sonnet",
         },
@@ -421,7 +493,7 @@ export async function runAgentCoreAgent(
     const durationMs = Date.now() - started;
     const errorMessage = error instanceof Error ? error.message : String(error);
 
-    log.error(`agentcore invoke error: session=${sessionKey} error=${errorMessage}`);
+    log.error(`agentcore invoke error: session=${agentCoreSessionId} error=${errorMessage}`);
 
     // Emit lifecycle error event
     if (params.runId) {
@@ -442,7 +514,7 @@ export async function runAgentCoreAgent(
       meta: {
         durationMs,
         agentMeta: {
-          sessionId: sessionKey,
+          sessionId: agentCoreSessionId,
           provider: "agentcore",
           model: "unknown",
         },
