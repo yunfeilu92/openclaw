@@ -27,7 +27,6 @@ import { resolveSessionAgentId } from "./agent-scope.js";
 import { resolveBootstrapContextForRun } from "./bootstrap-files.js";
 import { log } from "./pi-embedded-runner/logger.js";
 import { buildAgentSystemPrompt } from "./system-prompt.js";
-import { createAgentCoreMemoryRecallTool } from "./tools/agentcore-memory-tool.js";
 import { ensureCloudWorkspace, resolveWorkspaceClassification } from "./workspace.js";
 
 // AgentCore configuration from environment
@@ -126,13 +125,15 @@ function extractResponseText(result: Record<string, unknown>): string {
 }
 
 /**
- * Build context (workspace files, memory, system prompt) for an AgentCore request.
- * Best-effort: failures are logged but do not block the request.
+ * Build context (workspace files, system prompt) for an AgentCore request.
+ *
+ * Memory pre-fetch and history loading are NOT done here — they are the
+ * responsibility of the AgentCore Runtime (Python). The Gateway only
+ * prepares workspace context and system prompt.
  */
 async function buildAgentCoreContext(params: RunEmbeddedPiAgentParams): Promise<{
   systemPrompt: string;
   contextFiles: EmbeddedContextFile[];
-  memoryContext: string | null;
 }> {
   // 0. Ensure cloud workspace is seeded (no-op if already populated or if local)
   if (resolveWorkspaceClassification(params.config?.storage) === "cloud") {
@@ -164,39 +165,8 @@ async function buildAgentCoreContext(params: RunEmbeddedPiAgentParams): Promise<
     );
   }
 
-  // 2. Pre-fetch memory (best-effort, 3s timeout)
-  let memoryContext: string | null = null;
-  try {
-    const memoryTool = createAgentCoreMemoryRecallTool({ config: params.config });
-    if (memoryTool) {
-      const recallPromise = memoryTool.execute("prefetch", {
-        query: params.prompt,
-        maxResults: 5,
-      });
-      const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000));
-      const result = await Promise.race([recallPromise, timeoutPromise]);
-      if (result && typeof result === "object" && "content" in result) {
-        // content is (TextContent | ImageContent)[]; extract text from first text block
-        const contentArr = (result as { content: Array<{ type: string; text?: string }> }).content;
-        const textBlock = contentArr?.find((c) => c.type === "text" && c.text);
-        if (textBlock?.text) {
-          const parsed = JSON.parse(textBlock.text);
-          if (parsed.results && Array.isArray(parsed.results) && parsed.results.length > 0) {
-            memoryContext = parsed.results
-              .map((r: { text: string; score?: number }) => r.text)
-              .join("\n---\n");
-            log.debug(`agentcore context: pre-fetched ${parsed.results.length} memory records`);
-          }
-        }
-      }
-    }
-  } catch (err) {
-    log.warn(
-      `agentcore context: memory pre-fetch failed (non-blocking): ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-
-  // 3. Build system prompt with memory recall instructions + context files
+  // 2. Build system prompt with context files
+  // Memory recall is handled as a tool inside AgentCore Runtime (agent decides when to use it)
   const toolNames = ["agentcore_memory_recall"];
   let systemPrompt: string;
   try {
@@ -214,77 +184,47 @@ async function buildAgentCoreContext(params: RunEmbeddedPiAgentParams): Promise<
     systemPrompt = "You are a personal assistant running inside OpenClaw.";
   }
 
-  return { systemPrompt, contextFiles, memoryContext };
+  return { systemPrompt, contextFiles };
 }
 
 /**
- * Load recent transcript history from storage for passing to AgentCore Runtime.
- * Returns an array of {role, content} messages in chronological order.
- * Best-effort: returns empty array on failure.
+ * Resolve storage configuration details needed by AgentCore Runtime
+ * to read/write transcripts in the same location as the Gateway.
+ *
+ * This ensures Python Runtime uses the exact same actor/session scheme
+ * so that chat.history can read what Runtime writes.
  */
-async function loadRecentTranscriptHistory(
-  storageConfig: StorageConfig | undefined,
+function resolveStorageConfigForRuntime(
+  params: RunEmbeddedPiAgentParams,
   transcriptSessionId: string,
-  limit = 20,
-): Promise<Array<{ role: string; content: string }>> {
-  try {
-    const isCloudStorage = storageConfig?.type === "hybrid" || storageConfig?.type === "agentcore";
-    if (!isCloudStorage) return [];
-
-    const storageService = getStorageService(storageConfig);
-    await storageService.initialize();
-    const backend = storageService.getBackend(StorageNamespaces.TRANSCRIPTS);
-
-    const allMessages: Array<{ role: string; content: string }> = [];
-
-    for await (const line of backend.readLines(
-      StorageNamespaces.TRANSCRIPTS,
-      transcriptSessionId,
-    )) {
-      if (!line.trim()) continue;
-      try {
-        const entry = JSON.parse(line);
-        const msg = entry?.message;
-        if (!msg?.role) continue;
-        // Extract text from content (string or content array)
-        let text: string;
-        if (typeof msg.content === "string") {
-          text = msg.content;
-        } else if (Array.isArray(msg.content)) {
-          text =
-            msg.content
-              .filter((c: { type?: string; text?: string }) => c.type === "text" && c.text)
-              .map((c: { text: string }) => c.text)
-              .join("\n") || "";
-        } else {
-          continue;
-        }
-        if (text) {
-          allMessages.push({ role: msg.role, content: text });
-        }
-      } catch {
-        // skip bad lines
-      }
-    }
-
-    // AgentCore readLines returns newest-first; reverse to chronological
-    allMessages.reverse();
-
-    // Return only the most recent N messages
-    return allMessages.slice(-limit);
-  } catch (err) {
-    log.warn(
-      `agentcore loadTranscriptHistory failed (non-blocking): ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return [];
-  }
+): {
+  memory_arn: string;
+  namespace_prefix: string;
+  transcript_session_id: string;
+} | null {
+  const storageConfig = params.config?.storage;
+  const memoryArn = storageConfig?.agentcore?.memoryArn || process.env.AGENTCORE_MEMORY_ARN;
+  if (!memoryArn) return null;
+  return {
+    memory_arn: memoryArn,
+    namespace_prefix: storageConfig?.agentcore?.namespacePrefix ?? "default",
+    transcript_session_id: transcriptSessionId,
+  };
 }
 
 /**
  * Run an agent turn using AgentCore Runtime.
  *
- * This function provides the same interface as runEmbeddedPiAgent
- * but delegates execution to AWS Bedrock AgentCore.
+ * The Gateway acts as a thin routing layer:
+ * - Builds workspace context + system prompt
+ * - Forwards the raw user message to AgentCore Runtime
+ * - Receives the response and emits events to webchat
+ * - Updates session store entry with transcript URI
+ *
+ * All memory/history/transcript responsibilities belong to the Runtime:
+ * - Runtime loads its own session history (full, no limit)
+ * - Runtime decides whether to recall memory (via tool)
+ * - Runtime saves transcript with conversational payload (triggers LTM)
  */
 export async function runAgentCoreAgent(
   params: RunEmbeddedPiAgentParams,
@@ -292,35 +232,22 @@ export async function runAgentCoreAgent(
   const started = Date.now();
   const client = getClient();
 
-  // Build session key (must be at least 33 characters)
+  // Build session IDs
   const rawSessionKey = params.sessionKey || params.sessionId;
-  // Use transcriptSessionId (changes on /new) for both transcript and AgentCore session
-  // so that /new truly resets the conversation history.
+  // transcriptSessionId changes on /new → resets conversation history
   const transcriptSessionId = params.sessionId || rawSessionKey;
   const agentCoreSessionId = ensureSessionKeyLength(transcriptSessionId);
 
-  // Build context: workspace files, memory pre-fetch, system prompt
-  const { systemPrompt, contextFiles, memoryContext } = await buildAgentCoreContext(params);
+  // Build context: workspace files + system prompt (NO memory pre-fetch)
+  const { systemPrompt, contextFiles } = await buildAgentCoreContext(params);
 
-  // Load recent conversation history from transcript storage
-  const storageConfig = params.config?.storage;
-  const history = await loadRecentTranscriptHistory(storageConfig, transcriptSessionId);
+  // Resolve storage config so Runtime knows where to read/write transcripts
+  const runtimeStorageConfig = resolveStorageConfigForRuntime(params, transcriptSessionId);
 
-  // Enrich prompt with pre-fetched memory (fallback for servers that ignore system_prompt)
-  let enrichedPrompt = params.prompt;
-  if (memoryContext) {
-    enrichedPrompt = `[Recalled Memory]\n${memoryContext}\n\n[User Message]\n${params.prompt}`;
-  }
-
-  // Build AgentCore payload
-  // - prompt: enriched with recalled memory (for the current agent turn)
-  // - raw_prompt: original user message (for saving to session history)
-  // - history: recent conversation history from Gateway transcript (replaces Python session_manager)
+  // Build AgentCore payload — Gateway passes raw prompt, Runtime owns all intelligence
   const payload = {
-    prompt: enrichedPrompt,
-    raw_prompt: params.prompt,
+    prompt: params.prompt,
     session_id: agentCoreSessionId,
-    history,
     system_prompt: systemPrompt,
     context: {
       channel: params.messageChannel || params.messageProvider || "api",
@@ -330,11 +257,11 @@ export async function runAgentCoreAgent(
       group_id: params.groupId || undefined,
     },
     context_files: contextFiles.map((f) => ({ path: f.path, content: f.content })),
-    ...(memoryContext ? { memory_context: memoryContext } : {}),
+    ...(runtimeStorageConfig ? { storage: runtimeStorageConfig } : {}),
   };
 
   log.info(
-    `agentcore invoke start: session=${agentCoreSessionId} transcript=${transcriptSessionId} channel=${payload.context.channel} runId=${params.runId || "none"} contextFiles=${contextFiles.length} hasMemory=${!!memoryContext} historyLen=${history.length}`,
+    `agentcore invoke start: session=${agentCoreSessionId} transcript=${transcriptSessionId} channel=${payload.context.channel} runId=${params.runId || "none"} contextFiles=${contextFiles.length}`,
   );
 
   // Emit lifecycle start event
@@ -436,23 +363,21 @@ export async function runAgentCoreAgent(
       });
     }
 
-    // Write transcript to storage BEFORE emitting lifecycle "end".
-    // The webchat reloads chat.history on "end", so the data must be persisted first.
-    const isCloudStorage = storageConfig?.type === "hybrid" || storageConfig?.type === "agentcore";
-    if (isCloudStorage && responseText) {
-      await writeTranscriptToStorage(
+    // Update session store entry with transcript URI so chat.history knows where to read.
+    // Transcript DATA is written by AgentCore Runtime (Python), not by Gateway.
+    // Runtime writes before returning, so data is already available by the time we get here.
+    if (runtimeStorageConfig) {
+      await updateSessionEntryWithTranscriptUri(
         params,
-        storageConfig,
+        runtimeStorageConfig.memory_arn,
         transcriptSessionId,
-        responseText,
-        started,
       );
     }
 
     // Persist workspace file updates from AgentCore response (best-effort)
     if (workspaceUpdates.length > 0) {
       try {
-        await persistWorkspaceUpdates(storageConfig, workspaceUpdates);
+        await persistWorkspaceUpdates(params.config?.storage, workspaceUpdates);
       } catch (err) {
         log.warn(
           `agentcore workspace update failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -528,110 +453,38 @@ export async function runAgentCoreAgent(
 }
 
 /**
- * Persist user + assistant messages to cloud storage (background, best-effort).
+ * Update session store entry with the AgentCore transcript URI.
+ *
+ * This tells chat.history where to read transcript data from.
+ * The actual transcript data is written by AgentCore Runtime (Python),
+ * not by the Gateway.
  */
-async function writeTranscriptToStorage(
+async function updateSessionEntryWithTranscriptUri(
   params: RunEmbeddedPiAgentParams,
-  storageConfig: NonNullable<RunEmbeddedPiAgentParams["config"]>["storage"],
+  memoryArn: string,
   transcriptSessionId: string,
-  responseText: string,
-  started: number,
 ): Promise<void> {
+  if (!params.sessionKey) return;
   try {
-    const storageService = getStorageService(storageConfig);
-    await storageService.initialize();
-    const backend = storageService.getBackend(StorageNamespaces.TRANSCRIPTS);
-
-    const supportsConversational = typeof backend.appendConversational === "function";
-    log.debug(
-      `agentcore writeTranscript: transcriptSessionId=${transcriptSessionId} supportsConversational=${supportsConversational} backendType=${backend.type} promptLen=${params.prompt.length} responseLen=${responseText.length}`,
-    );
-
-    if (supportsConversational) {
-      await backend.appendConversational!(
-        StorageNamespaces.TRANSCRIPTS,
-        transcriptSessionId,
-        "user",
-        params.prompt,
-        { source: "webchat" },
-      );
-      await backend.appendConversational!(
-        StorageNamespaces.TRANSCRIPTS,
-        transcriptSessionId,
-        "assistant",
-        responseText,
-        { source: "agentcore" },
-      );
-    } else {
-      const userEntry = {
-        type: "message",
-        id: `user-${Date.now()}`,
-        timestamp: new Date().toISOString(),
-        message: {
-          role: "user",
-          content: [{ type: "text", text: params.prompt }],
-          timestamp: started,
-        },
-      };
-      await backend.append(
-        StorageNamespaces.TRANSCRIPTS,
-        transcriptSessionId,
-        JSON.stringify(userEntry),
-      );
-
-      const assistantEntry = {
-        type: "message",
-        id: `assistant-${Date.now()}`,
-        timestamp: new Date().toISOString(),
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: responseText }],
-          timestamp: Date.now(),
-          stopReason: "stop",
-          usage: { input: 0, output: 0, totalTokens: 0 },
-        },
-      };
-      await backend.append(
-        StorageNamespaces.TRANSCRIPTS,
-        transcriptSessionId,
-        JSON.stringify(assistantEntry),
-      );
-    }
-    log.info(`agentcore transcript written to storage: session=${transcriptSessionId}`);
-
-    // Update session entry with AgentCore URI so chat.history can read from it
-    const memoryArn = storageConfig?.agentcore?.memoryArn || process.env.AGENTCORE_MEMORY_ARN;
-    log.debug(
-      `agentcore writeTranscript: updating session entry: memoryArn=${memoryArn ?? "none"} sessionKey=${params.sessionKey ?? "none"}`,
-    );
-    if (memoryArn && params.sessionKey) {
-      try {
-        const sessionFileUri = buildAgentCoreTranscriptUri(memoryArn, transcriptSessionId);
-        log.debug(`agentcore writeTranscript: sessionFileUri=${sessionFileUri}`);
-        const agentId = resolveSessionAgentId({
-          sessionKey: params.sessionKey,
-          config: params.config,
-        });
-        const storePath = resolveStorePath(params.config?.session?.store, { agentId });
-        await updateSessionStore(storePath, (store) => {
-          const entry = store[params.sessionKey!];
-          if (entry) {
-            entry.sessionFile = sessionFileUri;
-            entry.updatedAt = Date.now();
-          }
-        });
-        log.info(
-          `agentcore session entry updated with URI: sessionKey=${params.sessionKey} sessionFile=${sessionFileUri}`,
-        );
-      } catch (updateErr) {
-        log.warn(
-          `agentcore session entry update failed: ${updateErr instanceof Error ? updateErr.message : String(updateErr)}`,
-        );
+    const sessionFileUri = buildAgentCoreTranscriptUri(memoryArn, transcriptSessionId);
+    const agentId = resolveSessionAgentId({
+      sessionKey: params.sessionKey,
+      config: params.config,
+    });
+    const storePath = resolveStorePath(params.config?.session?.store, { agentId });
+    await updateSessionStore(storePath, (store) => {
+      const entry = store[params.sessionKey!];
+      if (entry) {
+        entry.sessionFile = sessionFileUri;
+        entry.updatedAt = Date.now();
       }
-    }
+    });
+    log.info(
+      `agentcore session entry updated: sessionKey=${params.sessionKey} sessionFile=${sessionFileUri}`,
+    );
   } catch (err) {
     log.warn(
-      `agentcore transcript write failed: ${err instanceof Error ? err.message : String(err)}`,
+      `agentcore session entry update failed: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
 }
