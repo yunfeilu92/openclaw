@@ -69,6 +69,14 @@ const saveSessionToMemory: HookHandler = async (event) => {
   }
 
   try {
+    // AgentCore mode: Strategy mechanism handles LTM extraction automatically
+    const hookCfg = event.context?.cfg as OpenClawConfig | undefined;
+    const storageType = hookCfg?.storage?.type;
+    if (storageType === "agentcore" || storageType === "hybrid") {
+      console.log("[session-memory] Skipped: AgentCore Strategy handles LTM");
+      return;
+    }
+
     console.log("[session-memory] Hook triggered for /new command");
 
     const context = event.context || {};

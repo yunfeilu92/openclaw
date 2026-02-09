@@ -35,11 +35,11 @@ describe("agentcore_memory_recall tool", () => {
 
   it("returns formatted results on successful API call", async () => {
     const mockSend = vi.fn().mockResolvedValue({
-      memoryRecords: [
-        { content: { text: "User prefers dark mode" }, score: 0.92, recordId: "rec-1" },
-        { content: { text: "Last project was a CLI tool" }, score: 0.78, recordId: "rec-2" },
-        { content: { text: "" }, score: 0.1, recordId: "rec-3" },
-        { content: undefined, score: 0.05, recordId: "rec-4" },
+      memoryRecordSummaries: [
+        { content: { text: "User prefers dark mode" }, score: 0.92, memoryRecordId: "rec-1" },
+        { content: { text: "Last project was a CLI tool" }, score: 0.78, memoryRecordId: "rec-2" },
+        { content: { text: "" }, score: 0.1, memoryRecordId: "rec-3" },
+        { content: undefined, score: 0.05, memoryRecordId: "rec-4" },
       ],
     });
 

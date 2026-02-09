@@ -20,6 +20,11 @@ export async function getMemorySearchManager(params: {
   cfg: OpenClawConfig;
   agentId: string;
 }): Promise<MemorySearchManagerResult> {
+  // AgentCore mode: Runtime owns memory; skip local index initialization
+  if (params.cfg.storage?.type === "agentcore" || params.cfg.storage?.type === "hybrid") {
+    return { manager: null };
+  }
+
   const resolved = resolveMemoryBackendConfig(params);
   if (resolved.backend === "qmd" && resolved.qmd) {
     const cacheKey = buildQmdCacheKey(params.agentId, resolved.qmd);

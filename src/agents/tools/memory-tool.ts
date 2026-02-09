@@ -30,6 +30,11 @@ export function createMemorySearchTool(options: {
   if (!cfg) {
     return null;
   }
+  // AgentCore mode: Runtime owns memory via retrieve-memory-records
+  const storageType = cfg.storage?.type;
+  if (storageType === "agentcore" || storageType === "hybrid") {
+    return null;
+  }
   const agentId = resolveSessionAgentId({
     sessionKey: options.agentSessionKey,
     config: cfg,
@@ -93,6 +98,11 @@ export function createMemoryGetTool(options: {
 }): AnyAgentTool | null {
   const cfg = options.config;
   if (!cfg) {
+    return null;
+  }
+  // AgentCore mode: Runtime owns memory via retrieve-memory-records
+  const storageType = cfg.storage?.type;
+  if (storageType === "agentcore" || storageType === "hybrid") {
     return null;
   }
   const agentId = resolveSessionAgentId({
