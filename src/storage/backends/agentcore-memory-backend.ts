@@ -638,14 +638,15 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
     const agentCoreRole = role === "user" ? "USER" : "ASSISTANT";
 
     // Build metadata with timestamp if not provided
-    const eventMetadata: Record<string, { value: string }> = {};
+    // SDK expects { stringValue: ... }, not { value: ... }
+    const eventMetadata: Record<string, { stringValue: string }> = {};
     if (metadata) {
       for (const [k, v] of Object.entries(metadata)) {
-        eventMetadata[k] = { value: v };
+        eventMetadata[k] = { stringValue: v };
       }
     }
     if (!eventMetadata.timestamp) {
-      eventMetadata.timestamp = { value: new Date().toISOString() };
+      eventMetadata.timestamp = { stringValue: new Date().toISOString() };
     }
 
     // Build transcript entry for recovery (same format as append)
