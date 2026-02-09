@@ -28,6 +28,7 @@ import { resolveStateDir } from "../config/paths.js";
 import { AgentCoreMemoryBackend } from "./backends/agentcore-memory-backend.js";
 import { DynamoDBBackend } from "./backends/dynamodb-backend.js";
 import { FileBackend } from "./backends/file-backend.js";
+import { S3Backend } from "./backends/s3-backend.js";
 import { SecretsManagerBackend } from "./backends/secrets-manager-backend.js";
 import { StorageNamespaces } from "./types.js";
 
@@ -88,6 +89,7 @@ export class StorageService implements IStorageService {
   private agentcoreBackend: AgentCoreMemoryBackend | null = null;
   private dynamodbBackend: DynamoDBBackend | null = null;
   private secretsManagerBackend: SecretsManagerBackend | null = null;
+  private s3Backend: S3Backend | null = null;
 
   private initialized = false;
 
@@ -122,6 +124,15 @@ export class StorageService implements IStorageService {
     // Special handling for AUTH namespace with Secrets Manager
     if (namespace === StorageNamespaces.AUTH && this.config.secretsManager) {
       return this.getSecretsManagerBackend();
+    }
+
+    // S3 routing: workspace files go to S3 when s3 bucket is configured
+    if (
+      namespace === StorageNamespaces.WORKSPACE &&
+      classification === "cloud" &&
+      this.config.s3?.bucket
+    ) {
+      return this.getS3Backend();
     }
 
     // Hybrid mode routing
@@ -225,6 +236,23 @@ export class StorageService implements IStorageService {
     return this.secretsManagerBackend;
   }
 
+  private getS3Backend(): S3Backend {
+    if (!this.s3Backend) {
+      if (!this.config.s3?.bucket) {
+        throw new Error(
+          "S3 storage configured but bucket not provided. " +
+            "Set storage.s3.bucket in your configuration.",
+        );
+      }
+      this.s3Backend = new S3Backend({
+        bucket: this.config.s3.bucket,
+        prefix: this.config.s3.prefix,
+        region: this.config.s3.region,
+      });
+    }
+    return this.s3Backend;
+  }
+
   /**
    * Initialize all configured backends.
    */
@@ -256,6 +284,18 @@ export class StorageService implements IStorageService {
       } catch (err) {
         console.warn(
           `DynamoDB initialization failed, falling back to file storage: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+
+    if (this.config.s3?.bucket) {
+      try {
+        await this.getS3Backend().initialize();
+      } catch (err) {
+        console.warn(
+          `S3 initialization failed, falling back to file storage: ${
             err instanceof Error ? err.message : String(err)
           }`,
         );
@@ -295,6 +335,9 @@ export class StorageService implements IStorageService {
     if (this.secretsManagerBackend) {
       closePromises.push(this.secretsManagerBackend.close());
     }
+    if (this.s3Backend) {
+      closePromises.push(this.s3Backend.close());
+    }
 
     await Promise.all(closePromises);
 
@@ -302,6 +345,7 @@ export class StorageService implements IStorageService {
     this.agentcoreBackend = null;
     this.dynamodbBackend = null;
     this.secretsManagerBackend = null;
+    this.s3Backend = null;
     this.initialized = false;
   }
 
@@ -349,6 +393,12 @@ export class StorageService implements IStorageService {
 
       if (namespace === StorageNamespaces.AUTH && this.config.secretsManager) {
         backendType = "secrets-manager";
+      } else if (
+        namespace === StorageNamespaces.WORKSPACE &&
+        classification === "cloud" &&
+        this.config.s3?.bucket
+      ) {
+        backendType = "s3";
       } else if (this.config.type === "hybrid" && classification === "cloud") {
         // Hybrid mode backend selection
         if (namespace === StorageNamespaces.SESSIONS && this.config.dynamodb?.tableName) {

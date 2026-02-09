@@ -102,6 +102,7 @@
     "@aws-sdk/client-bedrock": "^3.984.0",
     "@aws-sdk/client-bedrock-agentcore": "^3.983.0",
     "@aws-sdk/client-dynamodb": "^3.983.0",
+    "@aws-sdk/client-s3": "^3.985.0",
     "@aws-sdk/client-secrets-manager": "^3.983.0",
     "@aws-sdk/lib-dynamodb": "^3.983.0",
     "@buape/carbon": "0.14.0",

@@ -64,6 +64,19 @@ export type DynamoDBStorageConfig = {
 };
 
 /**
+ * AWS S3 configuration for workspace file storage.
+ * Bucket MUST be private (no public access) — accessed via IAM credentials only.
+ */
+export type S3StorageConfig = {
+  /** S3 bucket name (must be private, no public access) */
+  bucket: string;
+  /** Optional path prefix, e.g. "openclaw/workspace" */
+  prefix?: string;
+  /** AWS region (defaults to AWS_REGION env var) */
+  region?: string;
+};
+
+/**
  * Storage backend configuration.
  */
 export type StorageConfig = {
@@ -95,6 +108,12 @@ export type StorageConfig = {
    * AWS Secrets Manager configuration (optional, for cloud auth storage).
    */
   secretsManager?: SecretsManagerConfig;
+
+  /**
+   * S3 configuration (for workspace file storage).
+   * Bucket must be private — no public access.
+   */
+  s3?: S3StorageConfig;
 
   /**
    * Enable caching for cloud storage operations.

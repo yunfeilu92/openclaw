@@ -14,7 +14,6 @@ import {
   InvokeAgentRuntimeCommand,
 } from "@aws-sdk/client-bedrock-agentcore";
 import type { StorageConfig } from "../config/types.storage.js";
-import type { EmbeddedContextFile } from "./pi-embedded-helpers/types.js";
 import type { RunEmbeddedPiAgentParams } from "./pi-embedded-runner/run/params.js";
 import type { EmbeddedPiRunResult } from "./pi-embedded-runner/types.js";
 import { resolveStorePath } from "../config/sessions/paths.js";
@@ -24,7 +23,6 @@ import { getStorageService } from "../storage/storage-service.js";
 import { buildAgentCoreTranscriptUri } from "../storage/transcript-uri.js";
 import { StorageNamespaces } from "../storage/types.js";
 import { resolveSessionAgentId } from "./agent-scope.js";
-import { resolveBootstrapContextForRun } from "./bootstrap-files.js";
 import { log } from "./pi-embedded-runner/logger.js";
 import { buildAgentSystemPrompt } from "./system-prompt.js";
 import { ensureCloudWorkspace, resolveWorkspaceClassification } from "./workspace.js";
@@ -125,17 +123,17 @@ function extractResponseText(result: Record<string, unknown>): string {
 }
 
 /**
- * Build context (workspace files, system prompt) for an AgentCore request.
+ * Build system prompt for an AgentCore request.
  *
- * Memory pre-fetch and history loading are NOT done here — they are the
- * responsibility of the AgentCore Runtime (Python). The Gateway only
- * prepares workspace context and system prompt.
+ * Memory pre-fetch, history loading, and workspace file loading are NOT done
+ * here — they are the responsibility of the AgentCore Runtime (Python).
+ * The Gateway only prepares a base system prompt (without workspace files).
+ * Runtime loads workspace files from S3 and appends them to the prompt.
  */
 async function buildAgentCoreContext(params: RunEmbeddedPiAgentParams): Promise<{
   systemPrompt: string;
-  contextFiles: EmbeddedContextFile[];
 }> {
-  // 0. Ensure cloud workspace is seeded (no-op if already populated or if local)
+  // Ensure cloud workspace is seeded (no-op if already populated or if local)
   if (resolveWorkspaceClassification(params.config?.storage) === "cloud") {
     try {
       const svc = getStorageService(params.config?.storage);
@@ -148,32 +146,14 @@ async function buildAgentCoreContext(params: RunEmbeddedPiAgentParams): Promise<
     }
   }
 
-  // 1. Load workspace context files (SOUL.md, AGENTS.md, TOOLS.md, etc.)
-  let contextFiles: EmbeddedContextFile[] = [];
-  try {
-    const bootstrap = await resolveBootstrapContextForRun({
-      workspaceDir: params.workspaceDir,
-      config: params.config,
-      sessionKey: params.sessionKey,
-      sessionId: params.sessionId,
-    });
-    contextFiles = bootstrap.contextFiles;
-    log.debug(`agentcore context: loaded ${contextFiles.length} workspace files`);
-  } catch (err) {
-    log.warn(
-      `agentcore context: failed to load workspace files: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-
-  // 2. Build system prompt with context files
-  // Memory recall is handled as a tool inside AgentCore Runtime (agent decides when to use it)
+  // Build system prompt WITHOUT workspace files — Runtime loads them from S3
   const toolNames = ["agentcore_memory_recall"];
   let systemPrompt: string;
   try {
     systemPrompt = buildAgentSystemPrompt({
       workspaceDir: params.workspaceDir,
       toolNames,
-      contextFiles,
+      contextFiles: [],
       extraSystemPrompt: params.extraSystemPrompt,
       ownerNumbers: params.ownerNumbers,
     });
@@ -184,7 +164,7 @@ async function buildAgentCoreContext(params: RunEmbeddedPiAgentParams): Promise<
     systemPrompt = "You are a personal assistant running inside OpenClaw.";
   }
 
-  return { systemPrompt, contextFiles };
+  return { systemPrompt };
 }
 
 /**
@@ -238,11 +218,22 @@ export async function runAgentCoreAgent(
   const transcriptSessionId = params.sessionId || rawSessionKey;
   const agentCoreSessionId = ensureSessionKeyLength(transcriptSessionId);
 
-  // Build context: workspace files + system prompt (NO memory pre-fetch)
-  const { systemPrompt, contextFiles } = await buildAgentCoreContext(params);
+  // Build system prompt (NO workspace files, NO memory pre-fetch)
+  const { systemPrompt } = await buildAgentCoreContext(params);
 
   // Resolve storage config so Runtime knows where to read/write transcripts
   const runtimeStorageConfig = resolveStorageConfigForRuntime(params, transcriptSessionId);
+
+  // Resolve workspace S3 config so Runtime can load workspace files directly
+  const s3Config = params.config?.storage?.s3;
+  const workspaceStorage = s3Config?.bucket
+    ? {
+        s3_bucket: s3Config.bucket,
+        s3_prefix: s3Config.prefix ?? "",
+        s3_region: s3Config.region ?? process.env.AWS_REGION ?? "us-east-1",
+        namespace_prefix: params.config?.storage?.agentcore?.namespacePrefix ?? "default",
+      }
+    : undefined;
 
   // Build AgentCore payload — Gateway passes raw prompt, Runtime owns all intelligence
   const payload = {
@@ -256,12 +247,12 @@ export async function runAgentCoreAgent(
       is_group: !!params.groupId,
       group_id: params.groupId || undefined,
     },
-    context_files: contextFiles.map((f) => ({ path: f.path, content: f.content })),
     ...(runtimeStorageConfig ? { storage: runtimeStorageConfig } : {}),
+    ...(workspaceStorage ? { workspace_storage: workspaceStorage } : {}),
   };
 
   log.info(
-    `agentcore invoke start: session=${agentCoreSessionId} transcript=${transcriptSessionId} channel=${payload.context.channel} runId=${params.runId || "none"} contextFiles=${contextFiles.length}`,
+    `agentcore invoke start: session=${agentCoreSessionId} transcript=${transcriptSessionId} channel=${payload.context.channel} runId=${params.runId || "none"} workspaceStorage=${workspaceStorage ? "s3" : "none"}`,
   );
 
   // Emit lifecycle start event

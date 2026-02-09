@@ -18,3 +18,4 @@ export {
   createSecretsManagerBackend,
   type SecretsManagerBackendConfig,
 } from "./secrets-manager-backend.js";
+export { S3Backend, createS3Backend, type S3BackendConfig } from "./s3-backend.js";
