@@ -291,7 +291,7 @@ export class AgentCoreMemoryBackend implements IStorageBackend {
    * Sanitize key for use in session IDs.
    */
   private sanitizeKey(key: string): string {
-    return key.replace(/[^a-zA-Z0-9_.-]/g, "_");
+    return key.replace(/[^a-zA-Z0-9_-]/g, "_");
   }
 
   private getCacheKey(namespace: string, key: string): string {

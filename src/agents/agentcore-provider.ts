@@ -338,6 +338,14 @@ export async function runAgentCoreAgent(
       }
     }
 
+    // Strip <workspace_update> tags from the response text so they don't show to the user
+    if (responseText) {
+      responseText = responseText
+        .replace(/<workspace_update\s+filename="[^"]+"\s+delete="true"\s*\/?>/gi, "")
+        .replace(/<workspace_update\s+filename="[^"]+">[^]*?<\/workspace_update>/gi, "")
+        .trim();
+    }
+
     const durationMs = Date.now() - started;
     log.info(`agentcore invoke complete: session=${sessionKey} duration=${durationMs}ms`);
 
