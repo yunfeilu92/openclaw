@@ -57,6 +57,7 @@ describe("sandbox explain helpers", () => {
     expect(policy.allow).toEqual([
       "memory_search",
       "memory_get",
+      "agentcore_memory_recall",
       "read",
       "write",
       "edit",

@@ -1,6 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { AnyAgentTool } from "./common.js";
+import { log } from "../pi-embedded-runner/logger.js";
 import { jsonResult, readNumberParam, readStringParam } from "./common.js";
 
 const AgentCoreMemoryRecallSchema = Type.Object({
@@ -28,17 +29,16 @@ function resolveRegion(configRegion: string | undefined, arnRegion: string): str
   return configRegion ?? process.env.AWS_REGION ?? arnRegion;
 }
 
-/** Drop records with no text; keep score for transparency but don't filter by threshold. */
+/** Drop records with no text; map to simplified result shape. */
 function formatRecallResults(
-  records: Array<{ content?: { text?: string }; score?: number; recordId?: string }>,
+  records: Array<{ content?: { text?: string }; memoryRecordId?: string }>,
   query: string,
-): { results: Array<{ text: string; score?: number; id?: string }>; count: number; query: string } {
+): { results: Array<{ text: string; id?: string }>; count: number; query: string } {
   const results = records
     .filter((r) => r.content?.text?.trim())
     .map((r) => ({
       text: r.content!.text!.trim(),
-      ...(r.score != null ? { score: r.score } : {}),
-      ...(r.recordId ? { id: r.recordId } : {}),
+      ...(r.memoryRecordId ? { id: r.memoryRecordId } : {}),
     }));
   return { results, count: results.length, query };
 }
@@ -70,8 +70,8 @@ export function createAgentCoreMemoryRecallTool(options: {
     execute: async (_toolCallId, params) => {
       const query = readStringParam(params, "query", { required: true });
       const maxResults = readNumberParam(params, "maxResults") ?? 10;
-      console.log(
-        `[agentcore-debug][memory-recall] query="${query}" maxResults=${maxResults} memoryId=${parsed.memoryId} region=${region} namespace=${namespace}`,
+      log.debug(
+        `agentcore memory-recall: query="${query}" maxResults=${maxResults} memoryId=${parsed.memoryId} region=${region} namespace=${namespace}`,
       );
       try {
         const { BedrockAgentCoreClient, RetrieveMemoryRecordsCommand } =
@@ -80,21 +80,21 @@ export function createAgentCoreMemoryRecallTool(options: {
         const command = new RetrieveMemoryRecordsCommand({
           memoryId: parsed.memoryId,
           namespace,
-          query: { text: query },
+          searchCriteria: { searchQuery: query },
           maxResults,
         });
         const response = await client.send(command);
-        const records = response.memoryRecords ?? [];
-        console.log(`[agentcore-debug][memory-recall] returned ${records.length} records`);
+        const records = response.memoryRecordSummaries ?? [];
+        log.debug(`agentcore memory-recall: returned ${records.length} records`);
         for (const r of records) {
-          console.log(
-            `[agentcore-debug][memory-recall]   recordId=${r.recordId} score=${r.score} textLen=${r.content?.text?.length ?? 0}`,
+          log.debug(
+            `agentcore memory-recall:   memoryRecordId=${r.memoryRecordId} textLen=${r.content?.text?.length ?? 0}`,
           );
         }
         return jsonResult(formatRecallResults(records, query));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        console.log(`[agentcore-debug][memory-recall] ERROR: ${message}`);
+        log.debug(`agentcore memory-recall: ERROR: ${message}`);
         return jsonResult({ results: [], error: message, query });
       }
     },
