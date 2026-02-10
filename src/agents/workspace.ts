@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { StorageConfig } from "../config/types.storage.js";
 import type { DataClassification } from "../storage/types.js";
-import type { IStorageService } from "../storage/types.js";
+import type { IStorageBackend, IStorageService } from "../storage/types.js";
 import { runCommandWithTimeout } from "../process/exec.js";
 import { isSubagentSessionKey } from "../routing/session-key.js";
 import { StorageNamespaces } from "../storage/types.js";
@@ -366,6 +366,15 @@ export async function loadWorkspaceBootstrapFilesFromCloud(
  */
 export async function ensureCloudWorkspace(storageService: IStorageService): Promise<void> {
   const backend = storageService.getBackend(StorageNamespaces.WORKSPACE);
+  await ensureCloudWorkspaceWithBackend(backend);
+}
+
+/**
+ * Ensure cloud workspace has bootstrap files seeded from templates using a specific backend.
+ * This allows seeding to a per-user scoped S3 path without going through StorageService.
+ * No-op if any workspace files already exist.
+ */
+export async function ensureCloudWorkspaceWithBackend(backend: IStorageBackend): Promise<void> {
   const existing = await backend.list(StorageNamespaces.WORKSPACE);
   if (existing.length > 0) return; // already seeded
 

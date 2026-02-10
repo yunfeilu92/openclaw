@@ -25,7 +25,11 @@ import { StorageNamespaces } from "../storage/types.js";
 import { resolveSessionAgentId } from "./agent-scope.js";
 import { log } from "./pi-embedded-runner/logger.js";
 import { buildAgentSystemPrompt } from "./system-prompt.js";
-import { ensureCloudWorkspace, resolveWorkspaceClassification } from "./workspace.js";
+import {
+  ensureCloudWorkspace,
+  ensureCloudWorkspaceWithBackend,
+  resolveWorkspaceClassification,
+} from "./workspace.js";
 
 // AgentCore configuration from environment
 const AGENTCORE_RUNTIME_ARN =
@@ -35,6 +39,11 @@ const AGENTCORE_REGION = process.env.AWS_REGION || "us-east-1";
 
 // Minimum session key length required by AgentCore
 const MIN_SESSION_KEY_LENGTH = 33;
+
+/** Sanitize a value for use as an S3 key segment (agent_id, sender_id). */
+function sanitizeS3KeySegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
 
 let _client: BedrockAgentCoreClient | null = null;
 
@@ -130,19 +139,43 @@ function extractResponseText(result: Record<string, unknown>): string {
  * The Gateway only prepares a base system prompt (without workspace files).
  * Runtime loads workspace files from S3 and appends them to the prompt.
  */
-async function buildAgentCoreContext(params: RunEmbeddedPiAgentParams): Promise<{
+async function buildAgentCoreContext(
+  params: RunEmbeddedPiAgentParams,
+  scope?: { agentId: string; senderId: string; namespacePrefix: string },
+): Promise<{
   systemPrompt: string;
 }> {
-  // Ensure cloud workspace is seeded (no-op if already populated or if local)
+  // Ensure cloud workspace is seeded to per-user path (no-op if already populated or if local)
   if (resolveWorkspaceClassification(params.config?.storage) === "cloud") {
-    try {
-      const svc = getStorageService(params.config?.storage);
-      await svc.initialize();
-      await ensureCloudWorkspace(svc);
-    } catch (err) {
-      log.warn(
-        `agentcore context: cloud workspace seed failed (non-blocking): ${err instanceof Error ? err.message : String(err)}`,
-      );
+    const s3Config = params.config?.storage?.s3;
+    if (s3Config?.bucket && scope) {
+      try {
+        const { S3Backend } = await import("../storage/backends/s3-backend.js");
+        const scopedPrefix = [s3Config.prefix, scope.namespacePrefix, scope.agentId, scope.senderId]
+          .filter(Boolean)
+          .join("/");
+        const backend = new S3Backend({
+          bucket: s3Config.bucket,
+          prefix: scopedPrefix,
+          region: s3Config.region,
+        });
+        await ensureCloudWorkspaceWithBackend(backend);
+      } catch (err) {
+        log.warn(
+          `agentcore context: cloud workspace seed failed (non-blocking): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    } else {
+      // Fallback: seed to shared path (legacy)
+      try {
+        const svc = getStorageService(params.config?.storage);
+        await svc.initialize();
+        await ensureCloudWorkspace(svc);
+      } catch (err) {
+        log.warn(
+          `agentcore context: cloud workspace seed failed (non-blocking): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
   }
 
@@ -218,20 +251,29 @@ export async function runAgentCoreAgent(
   const transcriptSessionId = params.sessionId || rawSessionKey;
   const agentCoreSessionId = ensureSessionKeyLength(transcriptSessionId);
 
-  // Build system prompt (NO workspace files, NO memory pre-fetch)
-  const { systemPrompt } = await buildAgentCoreContext(params);
-
   // Resolve storage config so Runtime knows where to read/write transcripts
   const runtimeStorageConfig = resolveStorageConfigForRuntime(params, transcriptSessionId);
 
   // Resolve workspace S3 config so Runtime can load workspace files directly
   const s3Config = params.config?.storage?.s3;
+  const namespacePrefix = params.config?.storage?.agentcore?.namespacePrefix ?? "default";
+  const scopedAgentId = sanitizeS3KeySegment(params.agentAccountId || "main");
+  const scopedSenderId = sanitizeS3KeySegment(params.senderId || params.sessionKey || "anonymous");
+
+  // Build system prompt (NO workspace files, NO memory pre-fetch)
+  const { systemPrompt } = await buildAgentCoreContext(params, {
+    agentId: scopedAgentId,
+    senderId: scopedSenderId,
+    namespacePrefix,
+  });
   const workspaceStorage = s3Config?.bucket
     ? {
         s3_bucket: s3Config.bucket,
         s3_prefix: s3Config.prefix ?? "",
         s3_region: s3Config.region ?? process.env.AWS_REGION ?? "us-east-1",
-        namespace_prefix: params.config?.storage?.agentcore?.namespacePrefix ?? "default",
+        namespace_prefix: namespacePrefix,
+        agent_id: scopedAgentId,
+        sender_id: scopedSenderId,
       }
     : undefined;
 
@@ -368,7 +410,11 @@ export async function runAgentCoreAgent(
     // Persist workspace file updates from AgentCore response (best-effort)
     if (workspaceUpdates.length > 0) {
       try {
-        await persistWorkspaceUpdates(params.config?.storage, workspaceUpdates);
+        await persistWorkspaceUpdates(params.config?.storage, workspaceUpdates, {
+          agentId: scopedAgentId,
+          senderId: scopedSenderId,
+          namespacePrefix,
+        });
       } catch (err) {
         log.warn(
           `agentcore workspace update failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -487,19 +533,30 @@ async function updateSessionEntryWithTranscriptUri(
 type WorkspaceUpdate = { filename: string; content: string | null };
 
 /**
- * Persist workspace file updates from AgentCore response to cloud storage.
+ * Persist workspace file updates from AgentCore response to per-user S3 path.
+ * S3 key: {s3.prefix}/{namespace}/{agentId}/{senderId}/workspace/{filename}
  * No-op when workspace classification is not "cloud".
  */
 async function persistWorkspaceUpdates(
   storageConfig: StorageConfig | undefined,
   updates: WorkspaceUpdate[],
+  scope: { agentId: string; senderId: string; namespacePrefix: string },
 ): Promise<void> {
   if (!updates.length) return;
   if (resolveWorkspaceClassification(storageConfig) !== "cloud") return;
 
-  const svc = getStorageService(storageConfig);
-  await svc.initialize();
-  const backend = svc.getBackend(StorageNamespaces.WORKSPACE);
+  const s3Config = storageConfig?.s3;
+  if (!s3Config?.bucket) return;
+
+  const { S3Backend } = await import("../storage/backends/s3-backend.js");
+  const scopedPrefix = [s3Config.prefix, scope.namespacePrefix, scope.agentId, scope.senderId]
+    .filter(Boolean)
+    .join("/");
+  const backend = new S3Backend({
+    bucket: s3Config.bucket,
+    prefix: scopedPrefix,
+    region: s3Config.region,
+  });
 
   for (const u of updates) {
     if (u.content === null) {
@@ -508,7 +565,9 @@ async function persistWorkspaceUpdates(
       await backend.set(StorageNamespaces.WORKSPACE, u.filename, u.content);
     }
   }
-  log.info(`agentcore workspace: persisted ${updates.length} file update(s)`);
+  log.info(
+    `agentcore workspace: persisted ${updates.length} file update(s) to s3://${s3Config.bucket}/${scopedPrefix}/workspace/`,
+  );
 }
 
 /**
