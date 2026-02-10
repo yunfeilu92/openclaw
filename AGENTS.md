@@ -268,6 +268,96 @@ aws bedrock-agentcore list-events --memory-id "openclaw_agentcore_demo_mem-K4TRm
 pkill -f openclaw-gateway || true; nohup pnpm openclaw gateway run --bind loopback --port 18789 --force > /tmp/openclaw-gateway.log 2>&1 &
 ```
 
+### Gateway → Runtime 调用协议
+
+Gateway 通过 AWS SDK `InvokeAgentRuntimeCommand` 调用 Runtime，payload 经 `Buffer.from(JSON.stringify(payload))` 编码。
+
+#### Request (Gateway → Runtime)
+
+```json
+{
+  "prompt": "用户的原始消息 (无 enrichment)",
+  "session_id": "tr-{sanitized_key}，>=33 chars",
+  "system_prompt": "Gateway 构建的 system prompt (不含 workspace files，Runtime 从 S3 追加)",
+  "context": {
+    "channel": "api | telegram | discord | slack | web",
+    "agent_id": "main 或 params.agentAccountId",
+    "sender_id": "平台用户 ID (optional)",
+    "is_group": false,
+    "group_id": "群组 ID (optional, is_group=true 时)"
+  },
+  "storage": {
+    "memory_arn": "arn:aws:bedrock-agentcore:us-east-1:ACCOUNT:memory/MEMORY_ID",
+    "namespace_prefix": "default",
+    "transcript_session_id": "tr-{sanitized_key}"
+  },
+  "workspace_storage": {
+    "s3_bucket": "bucket name",
+    "s3_prefix": "openclaw/workspace",
+    "s3_region": "us-east-1",
+    "namespace_prefix": "default"
+  }
+}
+```
+
+- `storage` 和 `workspace_storage` 仅在配置了 AgentCore Memory / S3 时存在
+- `prompt` 是 raw 用户输入，不做 memory enrichment（memory recall 由 Runtime tool call 负责）
+
+#### Response (Runtime → Gateway)
+
+```json
+{
+  "response": "assistant 的文本回复",
+  "session_id": "echo back request 的 session_id",
+  "metadata": {
+    "model_id": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "tools_used": []
+  },
+  "workspace_updates": [{ "filename": "SOUL.md", "content": "文件内容 (null = 删除)" }]
+}
+```
+
+- `workspace_updates` 仅在 agent 使用 `<workspace_update>` tags 时存在
+- Gateway 从 response 中 strip `<workspace_update>` tags 后再返回给用户
+
+#### Response 解析优先级 (Gateway 侧)
+
+Gateway 按以下顺序尝试提取 response text:
+
+1. `result.content[].text` — Claude native format
+2. `result.response` — 直接字符串
+3. 如果 `response` 是 Python dict string (`{'role': 'assistant', 'content': [...]}`) → regex 提取 `'text'` value（`extractTextFromPythonDict()` fallback）
+4. `result.text` — 最终 fallback
+
+#### Transcript 存储格式 (Runtime 写入 AgentCore Memory)
+
+每条消息写入双 payload:
+
+```json
+{
+  "payload": [
+    {
+      "conversational": {
+        "role": "USER | ASSISTANT",
+        "content": { "text": "消息内容" }
+      }
+    },
+    {
+      "blob": {
+        "_type": "line",
+        "text": "{\"type\":\"message\",\"id\":\"...\",\"message\":{\"role\":\"...\",\"content\":\"...\"}}"
+      }
+    }
+  ],
+  "metadata": {
+    "timestamp": { "stringValue": "2026-02-10T..." }
+  }
+}
+```
+
+- `conversational` payload 触发 AgentCore LTM extraction
+- `blob` payload 用于 transcript 恢复 (Gateway `readLines()` 读取)
+
 ### Gotchas
 
 - AgentCore `readLines` 返回 events newest-first → 必须 reverse
