@@ -34,7 +34,7 @@ import {
 // AgentCore configuration from environment
 const AGENTCORE_RUNTIME_ARN =
   process.env.AGENTCORE_RUNTIME_ARN ||
-  "arn:aws:bedrock-agentcore:us-east-1:497892281794:runtime/openclaw_agentcore_demo-mgBuCB6xv5";
+  "arn:aws:bedrock-agentcore:us-east-1:497892281794:runtime/my_agent-kIxtLF89ok";
 const AGENTCORE_REGION = process.env.AWS_REGION || "us-east-1";
 
 // Minimum session key length required by AgentCore
