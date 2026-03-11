@@ -57,6 +57,19 @@ export const DynamoDBStorageConfigSchema = z
   .optional();
 
 /**
+ * Zod schema for S3 storage configuration.
+ * Bucket must be private (no public access).
+ */
+export const S3StorageConfigSchema = z
+  .object({
+    bucket: z.string().min(1),
+    prefix: z.string().optional(),
+    region: z.string().optional(),
+  })
+  .strict()
+  .optional();
+
+/**
  * Zod schema for storage configuration.
  */
 export const StorageConfigSchema = z
@@ -66,6 +79,7 @@ export const StorageConfigSchema = z
     agentcore: AgentCoreStorageConfigSchema,
     dynamodb: DynamoDBStorageConfigSchema,
     secretsManager: SecretsManagerConfigSchema,
+    s3: S3StorageConfigSchema,
     cacheEnabled: z.boolean().optional(),
     cacheTtlMs: z.number().int().positive().optional(),
   })
